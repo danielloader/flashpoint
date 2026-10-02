@@ -28,8 +28,9 @@ var flashpointBin, stubWebBin string
 var buildFlags []string
 
 // maxOutage bounds the restart gap: the time from the old server stopping to
-// the new one answering.
-var maxOutage = 2 * time.Second
+// the new one answering. It includes macOS's first-run scan of the new
+// binary (0.3–1s) on a machine without Developer Tools enabled.
+var maxOutage = 3 * time.Second
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "flashpoint-e2e")

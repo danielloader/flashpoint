@@ -200,7 +200,6 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 	}
 	a.sum = sum
 
-	tp := preflight(a.bin, a.plan.Root)
 	t1 := time.Now()
 	a.stopChild()
 	a.off.stop()
@@ -220,11 +219,7 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 		return Result{State: "not_ready", BuildMs: tb.Milliseconds(), Detail: detail, Errors: lines(a.tail.String())}
 	}
 	total := time.Since(t0)
-	detail := "build " + event.Seconds(tb)
-	if tp > 0 {
-		detail += ", first-run check " + event.Seconds(tp)
-	}
-	msg := fmt.Sprintf("ready in %s (%s, restart %s)", event.Seconds(total), detail, event.Seconds(time.Since(t1)))
+	msg := fmt.Sprintf("ready in %s (build %s, restart %s)", event.Seconds(total), event.Seconds(tb), event.Seconds(time.Since(t1)))
 	a.log.infof(event.API, "%s", msg)
 	a.log.update(func(s *event.Status) {
 		s.API, s.APIDetail, s.Serving, s.LastBuild, s.LastReady = event.APIReady, "", true, tb, total
