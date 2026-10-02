@@ -18,9 +18,10 @@ import (
 // hot-module reload; flashpoint only starts it, labels its output and makes
 // sure it goes when flashpoint does.
 type webServer struct {
-	plan *config.WebPlan
-	log  *logger
-	env  []string
+	plan  *config.WebPlan
+	log   *logger
+	env   []string
+	dials *dialCounter
 
 	mu sync.Mutex
 	p  *proc.Proc
@@ -52,7 +53,10 @@ func (w *webServer) start(ctx context.Context) {
 // exits.
 func (w *webServer) monitor(ctx context.Context, p *proc.Proc) {
 	addr := net.JoinHostPort("localhost", strconv.Itoa(w.plan.Port))
-	t := time.NewTicker(100 * time.Millisecond)
+	// One dial per attempt until the port accepts, then none: Vite's own
+	// exit is what marks it down.
+	poll := backoff{d: 100 * time.Millisecond, max: time.Second}
+	t := time.NewTimer(poll.next())
 	defer t.Stop()
 	for ready := false; ; {
 		select {
@@ -70,7 +74,12 @@ func (w *webServer) monitor(ctx context.Context, p *proc.Proc) {
 			if ready {
 				continue
 			}
-			if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
+			dctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			c, err := w.dials.dial(dctx, "tcp", addr)
+			cancel()
+			if err != nil {
+				t.Reset(poll.next())
+			} else {
 				c.Close()
 				ready = true
 				w.log.infof(event.Web, "ready on http://localhost:%d", w.plan.Port)

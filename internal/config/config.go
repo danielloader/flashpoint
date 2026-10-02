@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
@@ -22,6 +24,50 @@ type File struct {
 	API   API   `toml:"api"`
 	Web   Web   `toml:"web"`
 	Watch Watch `toml:"watch"`
+	Logs  Logs  `toml:"logs"`
+}
+
+// Logs tees each stream into a file. Paths are relative to the project root.
+type Logs struct {
+	// Dir writes api.log, web.log, flashpoint.log and all.log there.
+	Dir        string `toml:"dir"`
+	API        string `toml:"api"`
+	Web        string `toml:"web"`
+	Flashpoint string `toml:"flashpoint"`
+	All        string `toml:"all"`
+	Timestamps *bool  `toml:"timestamps"`
+	Truncate   bool   `toml:"truncate"`
+	MaxSize    Size   `toml:"max_size"`
+}
+
+// Size reads "10MB"-style strings (B, KB, MB, GB; powers of 1024).
+type Size struct{ Bytes int64 }
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *Size) UnmarshalText(b []byte) error {
+	n, err := ParseSize(string(b))
+	s.Bytes = n
+	return err
+}
+
+// ParseSize parses "10MB", "512KB", "1GB" or a plain byte count.
+func ParseSize(v string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(v))
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSpace(strings.TrimSuffix(t, u.suffix)), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("size %q: use e.g. 10MB", v)
+	}
+	return n * mult, nil
 }
 
 // API configures the Go server.
@@ -58,6 +104,9 @@ type Web struct {
 
 // Watch adds to and takes from the set of files that trigger a rebuild.
 type Watch struct {
+	// Enabled = false turns file watching off: rebuilds happen only on
+	// SIGUSR1 or `flashpoint reload`.
+	Enabled  *bool    `toml:"enabled"`
 	Include  []string `toml:"include"`
 	Exclude  []string `toml:"exclude"`
 	Debounce Duration `toml:"debounce"`

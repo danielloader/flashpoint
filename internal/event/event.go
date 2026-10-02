@@ -33,6 +33,7 @@ const (
 	Info                   // flashpoint's own note, e.g. "ready in 1.2s"
 	Error                  // flashpoint's note about a failure
 	Diagnostic             // compiler output from a failed build
+	Marker                 // "--- build #3 started": for log files, not screens
 )
 
 // Line is one line of log.
@@ -83,7 +84,9 @@ type Status struct {
 	Serving bool
 	// Handoff is true when the server takes flashpoint's socket, so restarts
 	// refuse no connections.
-	Handoff   bool
+	Handoff bool
+	// Watching is false when rebuilds happen only on request.
+	Watching  bool
 	LastBuild time.Duration
 	LastReady time.Duration // save to serving, for the last swap
 	// ErrorSeq is the first line of the last failed build's output.
@@ -94,6 +97,10 @@ type Status struct {
 
 	APIURL string
 	WebURL string
+
+	// ProbeDials counts the connections flashpoint has opened to check
+	// readiness, for GET /status; it should stay flat while idle.
+	ProbeDials int64
 }
 
 // Sink receives events. Its methods may be called from any goroutine.

@@ -8,11 +8,11 @@ import (
 
 func TestQueueMerges(t *testing.T) {
 	q := newQueue()
-	q.push([]string{"a.go"}, false)
-	q.push([]string{"b.go"}, true)
+	q.push(trigger{files: []string{"a.go"}})
+	q.push(trigger{files: []string{"b.go"}, reasons: []string{"signal"}, force: true})
 	<-q.c
 	got, ok := q.take()
-	if !ok || !slices.Equal(got.files, []string{"a.go", "b.go"}) || !got.force {
+	if !ok || !slices.Equal(got.files, []string{"a.go", "b.go"}) || !got.force || !slices.Equal(got.reasons, []string{"signal"}) {
 		t.Fatalf("got %+v", got)
 	}
 	if _, ok := q.take(); ok {

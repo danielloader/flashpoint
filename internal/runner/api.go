@@ -26,10 +26,37 @@ import (
 // readyTimeout bounds the wait for a new server to answer its health path.
 const readyTimeout = 60 * time.Second
 
-// trigger is one reason to build: saved files, or a manual rebuild.
+// trigger is one reason to build: saved files, or a request.
 type trigger struct {
-	files []string
-	force bool // restart even if the binary did not change
+	files   []string
+	reasons []string // "signal", "cli", "key"
+	force   bool     // restart even if the binary did not change
+	waiters []chan<- Result
+}
+
+// Result is how a build cycle ended, for `flashpoint reload --wait`.
+type Result struct {
+	OK      bool     `json:"ok"`
+	State   string   `json:"state"` // queued, ready, no_change, build_failed, not_ready, stopping
+	BuildMs int64    `json:"buildMs,omitempty"`
+	Detail  string   `json:"detail,omitempty"`
+	Errors  []string `json:"errors,omitempty"` // compiler output, or the server's last lines
+	// Logs are the log files in use, by stream.
+	Logs map[string]string `json:"logs,omitempty"`
+
+	took time.Duration
+}
+
+func marker(n int, r Result) string {
+	switch r.State {
+	case "ready":
+		return fmt.Sprintf("--- build #%d ok in %s", n, event.Seconds(r.took))
+	case "no_change":
+		return fmt.Sprintf("--- build #%d ok in %s, no change", n, event.Seconds(r.took))
+	case "build_failed":
+		return fmt.Sprintf("--- build #%d failed in %s", n, event.Seconds(r.took))
+	}
+	return fmt.Sprintf("--- build #%d %s: %s", n, strings.ReplaceAll(r.State, "_", " "), r.Detail)
 }
 
 // queue holds at most one pending trigger; pushes while a build runs merge
@@ -42,13 +69,15 @@ type queue struct {
 
 func newQueue() *queue { return &queue{c: make(chan struct{}, 1)} }
 
-func (q *queue) push(files []string, force bool) {
+func (q *queue) push(t trigger) {
 	q.mu.Lock()
 	if q.t == nil {
 		q.t = &trigger{}
 	}
-	q.t.files = append(q.t.files, files...)
-	q.t.force = q.t.force || force
+	q.t.files = append(q.t.files, t.files...)
+	q.t.reasons = append(q.t.reasons, t.reasons...)
+	q.t.waiters = append(q.t.waiters, t.waiters...)
+	q.t.force = q.t.force || t.force
 	q.mu.Unlock()
 	select {
 	case q.c <- struct{}{}:
@@ -84,12 +113,18 @@ type apiServer struct {
 	exited  chan *proc.Proc
 	tail    *tail
 	offText string
+	probe   *http.Client
+	builds  int
+	logs    map[string]string
 }
 
 func (a *apiServer) loop(ctx context.Context, q *queue, relist func() error) {
 	for {
 		select {
 		case <-ctx.Done():
+			if t, ok := q.take(); ok {
+				reply(t.waiters, Result{State: "stopping", Detail: "flashpoint is stopping"})
+			}
 			a.off.stop()
 			a.stopChild()
 			return
@@ -98,7 +133,22 @@ func (a *apiServer) loop(ctx context.Context, q *queue, relist func() error) {
 			if !ok {
 				continue
 			}
-			a.cycle(ctx, t)
+			a.builds++
+			why := "start"
+			switch {
+			case len(t.reasons) > 0:
+				why = strings.Join(uniq(t.reasons), ", ")
+			case len(t.files) > 0:
+				why = summarise(t.files)
+			}
+			a.log.line(event.API, event.Marker, fmt.Sprintf("--- build #%d started (%s)", a.builds, why))
+			res := a.cycle(ctx, t)
+			if ctx.Err() != nil {
+				res = Result{State: "stopping", Detail: "flashpoint is stopping"}
+			}
+			a.log.line(event.API, event.Marker, marker(a.builds, res))
+			res.Logs = a.logs
+			reply(t.waiters, res)
 			if ctx.Err() == nil {
 				if err := relist(); err != nil {
 					a.log.errorf(event.API, "go list: %v", err)
@@ -118,10 +168,15 @@ func (a *apiServer) loop(ctx context.Context, q *queue, relist func() error) {
 	}
 }
 
-func (a *apiServer) cycle(ctx context.Context, t trigger) {
-	if len(t.files) > 0 {
+func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
+	switch {
+	case len(t.files) > 0 && len(t.reasons) > 0:
+		a.log.infof(event.API, "%s changed, and reload requested (%s); building", summarise(t.files), strings.Join(uniq(t.reasons), ", "))
+	case len(t.files) > 0:
 		a.log.infof(event.API, "%s changed; building", summarise(t.files))
-	} else if a.started {
+	case len(t.reasons) > 0:
+		a.log.infof(event.API, "reload requested (%s); building", strings.Join(uniq(t.reasons), ", "))
+	case a.started:
 		a.log.infof(event.API, "building")
 	}
 	a.log.update(func(s *event.Status) { s.API = event.APIBuilding })
@@ -133,22 +188,23 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) {
 	t0 := time.Now()
 	out, err := a.build(ctx)
 	if ctx.Err() != nil {
-		return
+		return Result{}
 	}
 	tb := time.Since(t0)
 	if err != nil {
-		a.buildFailed(out, tb)
-		return
+		summary := a.buildFailed(out, tb)
+		return Result{State: "build_failed", BuildMs: tb.Milliseconds(), Detail: summary, Errors: lines(string(out)), took: tb}
 	}
 	sum, err := hashFile(a.bin)
 	if err != nil {
 		a.log.errorf(event.API, "%v", err)
-		return
+		return Result{State: "not_ready", Detail: err.Error()}
 	}
 	if sum == a.sum && a.p.Running() && !t.force {
-		a.log.infof(event.API, "no change (%s)", event.Seconds(tb))
+		msg := fmt.Sprintf("no change (%s)", event.Seconds(tb))
+		a.log.infof(event.API, "%s", msg)
 		a.log.update(func(s *event.Status) { s.API, s.APIDetail, s.LastBuild = event.APIReady, "", tb })
-		return
+		return Result{OK: true, State: "no_change", BuildMs: tb.Milliseconds(), Detail: msg, took: tb}
 	}
 	a.sum = sum
 
@@ -162,10 +218,14 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) {
 		a.log.errorf(event.API, "start: %v", err)
 		a.log.update(func(s *event.Status) { s.API, s.Serving, s.APIDetail = event.APIOffline, false, err.Error() })
 		a.goOffline("flashpoint could not start the API server: " + err.Error())
-		return
+		return Result{State: "not_ready", Detail: err.Error()}
 	}
 	if !a.waitReady(ctx) {
-		return
+		detail := "the server did not answer " + a.plan.Health
+		if !a.p.Running() {
+			detail = fmt.Sprintf("the server exited with code %d", a.p.ExitCode())
+		}
+		return Result{State: "not_ready", BuildMs: tb.Milliseconds(), Detail: detail, Errors: lines(a.tail.String())}
 	}
 	total := time.Since(t0)
 	detail := fmt.Sprintf("build %s", event.Seconds(tb))
@@ -177,7 +237,8 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) {
 		what = "restart"
 	}
 	detail += fmt.Sprintf(", %s %s", what, event.Seconds(time.Since(t1)))
-	a.log.infof(event.API, "ready in %s (%s)", event.Seconds(total), detail)
+	msg := fmt.Sprintf("ready in %s (%s)", event.Seconds(total), detail)
+	a.log.infof(event.API, "%s", msg)
 	a.log.update(func(s *event.Status) {
 		s.API, s.APIDetail, s.Serving, s.LastBuild, s.LastReady = event.APIReady, "", true, tb, total
 	})
@@ -185,6 +246,35 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) {
 		os.WriteFile(a.reload, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o644)
 	}
 	a.started = true
+	return Result{OK: true, State: "ready", BuildMs: tb.Milliseconds(), Detail: msg, took: total}
+}
+
+func lines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(strings.TrimRight(s, "\n"), "\n") {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func reply(waiters []chan<- Result, r Result) {
+	for _, w := range waiters {
+		w <- r
+	}
+}
+
+func uniq(s []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range s {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (a *apiServer) build(ctx context.Context) ([]byte, error) {
@@ -202,7 +292,7 @@ func (a *apiServer) build(ctx context.Context) ([]byte, error) {
 
 var goErr = regexp.MustCompile(`^\S+\.go:\d+(:\d+)?: `)
 
-func (a *apiServer) buildFailed(out []byte, tb time.Duration) {
+func (a *apiServer) buildFailed(out []byte, tb time.Duration) string {
 	state := "nothing is serving until it builds"
 	if a.p.Running() {
 		state = "still serving the last good build"
@@ -238,6 +328,7 @@ func (a *apiServer) buildFailed(out []byte, tb time.Duration) {
 	if !running {
 		a.goOffline("the API build failed:\n\n" + string(out))
 	}
+	return summary
 }
 
 func firstLine(b []byte) string {
@@ -308,7 +399,11 @@ func (a *apiServer) waitReady(ctx context.Context) bool {
 		host = "127.0.0.1"
 	}
 	url := "http://" + net.JoinHostPort(host, strconv.Itoa(a.plan.APIPort)) + a.plan.Health
-	c := http.Client{Timeout: 2 * time.Second}
+	c := a.probe
+	// The old server's keep-alive connection is dead after the swap, and
+	// none is kept open to the new one between swaps.
+	defer c.CloseIdleConnections()
+	poll := backoff{d: 20 * time.Millisecond, max: 250 * time.Millisecond}
 	deadline := time.Now().Add(readyTimeout)
 	for p := a.p; time.Now().Before(deadline); {
 		if !p.Running() || ctx.Err() != nil {
@@ -327,7 +422,7 @@ func (a *apiServer) waitReady(ctx context.Context) bool {
 			return false
 		case <-p.Done():
 			return false
-		case <-time.After(20 * time.Millisecond):
+		case <-time.After(poll.next()):
 		}
 	}
 	a.log.errorf(event.API, "not answering %s after %s", url, readyTimeout)

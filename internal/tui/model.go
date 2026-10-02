@@ -139,6 +139,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) add(ls []event.Line) {
 	for _, l := range ls {
+		if l.Kind == event.Marker {
+			continue
+		}
 		text := sanitize(l.Text)
 		e := entry{Line: l, text: text, lower: strings.ToLower(ansi.Strip(text))}
 		m.lines = append(m.lines, e)

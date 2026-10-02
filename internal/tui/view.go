@@ -191,6 +191,9 @@ func (m *model) statusRow() string {
 	} else {
 		right = sDim.Render("following ")
 	}
+	if !st.Watching && st.API != event.APIStarting {
+		right = sDim.Render("watch: off · reload: signal  ") + right
+	}
 	if m.filter != "" && !m.filtering {
 		right = lipgloss.NewStyle().Foreground(amber).Render("filter: "+m.filter) + "  " + right
 	}

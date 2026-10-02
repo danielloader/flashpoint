@@ -35,6 +35,9 @@ const (
 
 // Line implements event.Sink.
 func (p *Printer) Line(l event.Line) {
+	if l.Kind == event.Marker {
+		return
+	}
 	text := l.Text
 	if !p.color {
 		text = ansi.Strip(text)

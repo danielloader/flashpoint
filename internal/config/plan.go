@@ -25,7 +25,11 @@ type Overrides struct {
 	WebPort *int
 	WebDir  string
 	NoWeb   bool
+	NoWatch bool
 	Args    []string
+	// Logs are the --log-* flags; their paths are already absolute.
+	Logs     Logs
+	LogTimes *bool
 }
 
 // Plan is everything flashpoint needs to run, resolved from flags, the
@@ -47,9 +51,60 @@ type Plan struct {
 
 	Web *WebPlan // nil when there is no web app or it is disabled
 
+	Logs     LogPlan
+	Watch    bool // rebuild on file changes, not only on request
 	Include  []string
 	Exclude  []string
 	Debounce time.Duration
+}
+
+// LogPlan says where each stream is teed; a stream without a path is kept
+// in memory only.
+type LogPlan struct {
+	Paths      map[string]string // api, web, flashpoint, all
+	Timestamps bool
+	Truncate   bool
+	MaxSize    int64
+}
+
+const defaultLogMaxSize = 10 << 20
+
+func resolveLogs(root string, f, o Logs, times *bool) LogPlan {
+	abs := func(p, base string) string {
+		if p == "" || filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(base, p)
+	}
+	lp := LogPlan{Paths: map[string]string{}, Timestamps: true, Truncate: f.Truncate || o.Truncate, MaxSize: defaultLogMaxSize}
+	for _, src := range []struct {
+		l    Logs
+		base string
+	}{{f, root}, {o, ""}} {
+		if d := abs(src.l.Dir, src.base); d != "" {
+			for _, name := range []string{"api", "web", "flashpoint", "all"} {
+				lp.Paths[name] = filepath.Join(d, name+".log")
+			}
+		}
+		for name, p := range map[string]string{"api": src.l.API, "web": src.l.Web, "flashpoint": src.l.Flashpoint, "all": src.l.All} {
+			if p != "" {
+				lp.Paths[name] = abs(p, src.base)
+			}
+		}
+	}
+	if f.Timestamps != nil {
+		lp.Timestamps = *f.Timestamps
+	}
+	if times != nil {
+		lp.Timestamps = *times
+	}
+	if f.MaxSize.Bytes > 0 {
+		lp.MaxSize = f.MaxSize.Bytes
+	}
+	if o.MaxSize.Bytes > 0 {
+		lp.MaxSize = o.MaxSize.Bytes
+	}
+	return lp
 }
 
 // WebPlan is how to run the dev server.
@@ -89,6 +144,8 @@ func Resolve(root string, f File, o Overrides, getenv func(string) string) (*Pla
 		APIHost:     f.API.Host,
 		Health:      first(f.API.Health, "/"),
 		PortEnv:     first(f.API.PortEnv, "PORT"),
+		Logs:        resolveLogs(root, f.Logs, o.Logs, o.LogTimes),
+		Watch:       !o.NoWatch && (f.Watch.Enabled == nil || *f.Watch.Enabled),
 		Include:     f.Watch.Include,
 		Exclude:     f.Watch.Exclude,
 		Debounce:    or(f.Watch.Debounce.Duration, 150*time.Millisecond),

@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -32,6 +33,8 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	flashpointBin = filepath.Join(dir, "flashpoint")
+	// Build output goes here, not the user's cache directory.
+	os.Setenv("FLASHPOINT_CACHE_DIR", filepath.Join(dir, "cache"))
 	stubWebBin = filepath.Join(dir, "stubweb")
 	for bin, pkg := range map[string]string{flashpointBin: ".", stubWebBin: "./testdata/stubweb"} {
 		args := append(append([]string{"build"}, buildFlags...), "-o", bin, pkg)
@@ -84,9 +87,9 @@ type session struct {
 	done  chan struct{}
 }
 
-func start(t *testing.T, root string) *session {
+func start(t *testing.T, root string, args ...string) *session {
 	t.Helper()
-	cmd := exec.Command(flashpointBin, "--no-tui")
+	cmd := exec.Command(flashpointBin, append([]string{"--no-tui"}, args...)...)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "FLASHPOINT_API_PORT=", "FLASHPOINT_WEB_PORT=")
 	out, _ := cmd.StdoutPipe()
@@ -143,9 +146,59 @@ func (r *session) wait(t *testing.T, prefix string) {
 	}
 }
 
+// testDials counts every connection the tests open to the API.
+var testDials atomic.Int64
+
+// client is shared, with enough idle connections for the probes, so they
+// reuse keep-alive connections instead of churning through ephemeral ports.
+var client = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 8,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			testDials.Add(1)
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	},
+}
+
+// ctlClient talks to the control socket by its relative path, as curl would:
+// the absolute temp path is too long for a unix socket.
+func ctlClient(t *testing.T, root string) *http.Client {
+	t.Helper()
+	t.Chdir(root)
+	return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", ".flashpoint/ctl")
+	}}}
+}
+
+type statusDoc struct {
+	API struct {
+		State   string `json:"state"`
+		Serving bool   `json:"serving"`
+	} `json:"api"`
+	ProbeDials int64             `json:"probeDials"`
+	Logs       map[string]string `json:"logs"`
+}
+
+func status(t *testing.T, c *http.Client) statusDoc {
+	t.Helper()
+	resp, err := c.Get("http://flashpoint/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var d statusDoc
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 func get(url string) (string, error) {
-	c := http.Client{Timeout: 5 * time.Second}
-	res, err := c.Get(url)
+	res, err := client.Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -190,8 +243,11 @@ func TestSwapRefusesNoConnections(t *testing.T) {
 	r := start(t, root)
 	r.wait(t, "api ▸ ready in")
 	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
+	ctl := ctlClient(t, root)
+	probeBefore := status(t, ctl).ProbeDials
+	dialsBefore := testDials.Load()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	var ok, failed atomic.Int64
 	var sawNew atomic.Bool
 	var firstErr atomic.Value
@@ -209,10 +265,15 @@ func TestSwapRefusesNoConnections(t *testing.T) {
 						sawNew.Store(true)
 					}
 				}
-				time.Sleep(2 * time.Millisecond)
+				time.Sleep(20 * time.Millisecond)
 			}
 		})
 	}
+	// A failed wait below must not leave the probes running.
+	t.Cleanup(func() {
+		cancel()
+		wg.Wait()
+	})
 
 	time.Sleep(200 * time.Millisecond)
 	edit(t, root, `"Hello from Go"`, `"Hello from flashpoint"`)
@@ -231,10 +292,23 @@ func TestSwapRefusesNoConnections(t *testing.T) {
 	if n := failed.Load(); n > 0 {
 		t.Fatalf("%d of %d requests failed during the swaps; first: %v", n, n+ok.Load(), firstErr.Load())
 	}
+	// One restart happened (the fix-back was byte-identical). Each probe
+	// needs a new connection when the old server closes its own; the +2 is
+	// slack for a probe that races the close and redials.
+	const probes, restarts = 4, 1
+	td := testDials.Load() - dialsBefore
+	pd := status(t, ctl).ProbeDials - probeBefore
+	t.Logf("dials: test probes %d (bound %d), flashpoint probes %d (bound %d), over %d requests", td, probes*(restarts+1)+2, pd, 2*restarts, ok.Load())
+	if td > probes*(restarts+1)+2 {
+		t.Errorf("test probes opened %d connections for %d restart(s)", td, restarts)
+	}
+	if pd > 2*restarts {
+		t.Errorf("flashpoint opened %d probe connections for %d restart(s)", pd, restarts)
+	}
 	if !sawNew.Load() {
 		t.Fatal("never saw the new build's response")
 	}
-	if ok.Load() < 50 {
+	if ok.Load() < 20 {
 		t.Fatalf("only %d requests ran", ok.Load())
 	}
 	if !portOpen(webPort) {
@@ -349,5 +423,131 @@ func TestOfflinePageExplainsAFailedBuild(t *testing.T) {
 	r.wait(t, "api ▸ ready in")
 	if _, err := get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func reloadCmd(t *testing.T, root string, args ...string) (int, string, string) {
+	t.Helper()
+	cmd := exec.Command(flashpointBin, append([]string{"reload"}, args...)...)
+	cmd.Dir = root
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.Run()
+	return cmd.ProcessState.ExitCode(), stdout.String(), stderr.String()
+}
+
+func TestSignalReloadWithWatchingOff(t *testing.T) {
+	const apiPort, webPort = 8517, 5517
+	root := project(t, apiPort, webPort, true)
+	r := start(t, root, "--watch=false")
+	r.wait(t, "api ▸ ready in")
+	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
+
+	edit(t, root, `"Hello from Go"`, `"Hello by signal"`)
+	time.Sleep(600 * time.Millisecond)
+	if strings.Contains(r.output(), "changed") {
+		t.Fatal("rebuilt on a file change with watching off")
+	}
+	pid, err := os.ReadFile(filepath.Join(root, ".flashpoint", "pid"))
+	if err != nil || strings.TrimSpace(string(pid)) != strconv.Itoa(r.cmd.Process.Pid) {
+		t.Fatalf("pidfile %q, %v", pid, err)
+	}
+	r.cmd.Process.Signal(syscall.SIGUSR1)
+	r.wait(t, "api ▸ ready in")
+	if !strings.Contains(r.output(), "reload requested (signal)") {
+		t.Fatal("no reload reason in the log")
+	}
+	if body, _ := get(url); !strings.Contains(body, "Hello by signal") {
+		t.Fatalf("body %q", body)
+	}
+	r.cmd.Process.Signal(syscall.SIGTERM)
+	<-r.done
+	if _, err := os.Stat(filepath.Join(root, ".flashpoint", "pid")); !os.IsNotExist(err) {
+		t.Fatal("pidfile left behind")
+	}
+}
+
+func TestReloadWait(t *testing.T) {
+	const apiPort, webPort = 8518, 5518
+	root := project(t, apiPort, webPort, true)
+	if code, _, _ := reloadCmd(t, root, "--wait"); code != exitNotRunning {
+		t.Fatalf("exit %d with nothing running, want %d", code, exitNotRunning)
+	}
+	r := start(t, root, "--watch=false")
+	r.wait(t, "api ▸ ready in")
+
+	edit(t, root, `"Hello from Go"`, `"Hello by cli"`)
+	code, stdout, stderr := reloadCmd(t, root, "--wait")
+	if code != 0 || !strings.HasPrefix(stdout, "ready in") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if body, _ := get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"); !strings.Contains(body, "Hello by cli") {
+		t.Fatalf("reload --wait returned before the new build served: %q", body)
+	}
+	if !strings.Contains(r.output(), "reload requested (cli)") {
+		t.Fatal("no reload reason in the log")
+	}
+
+	edit(t, root, `const message =`, `const message`)
+	code, _, stderr = reloadCmd(t, root, "--wait")
+	if code != exitError || !strings.Contains(stderr, "main.go:") || !strings.Contains(stderr, "build failed") {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+
+	// The same socket speaks plain HTTP.
+	d := status(t, ctlClient(t, root))
+	if d.API.State != "build failed" || !d.API.Serving {
+		t.Fatalf("status %+v", d)
+	}
+}
+
+func TestIdleOpensNoConnections(t *testing.T) {
+	const apiPort, webPort = 8519, 5519
+	root := project(t, apiPort, webPort, true)
+	r := start(t, root)
+	r.wait(t, "api ▸ ready in")
+	ctl := ctlClient(t, root)
+	deadline := time.Now().Add(10 * time.Second)
+	for !portOpen(webPort) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(time.Second)
+	before := status(t, ctl).ProbeDials
+	time.Sleep(10 * time.Second)
+	after := status(t, ctl).ProbeDials
+	t.Logf("flashpoint probe dials while idle for 10s: %d (total since start %d)", after-before, after)
+	if after != before {
+		t.Fatalf("flashpoint opened %d connections while idle", after-before)
+	}
+}
+
+func TestLogDir(t *testing.T) {
+	const apiPort, webPort = 8510, 5510
+	root := project(t, apiPort, webPort, true)
+	r := start(t, root, "--log-dir", filepath.Join(root, ".flashpoint", "logs"), "--watch=false")
+	r.wait(t, "api ▸ ready in")
+	edit(t, root, `const message =`, `const message`)
+	if code, _, _ := reloadCmd(t, root, "--wait"); code != exitError {
+		t.Fatalf("reload exit %d", code)
+	}
+	logs := filepath.Join(root, ".flashpoint", "logs")
+	api, _ := os.ReadFile(filepath.Join(logs, "api.log"))
+	for _, want := range []string{"=== flashpoint session started", "--- build #1 started (start)", "--- build #1 ok in", "listening on", "--- build #2 started (cli)", "--- build #2 failed in", "syntax error"} {
+		if !strings.Contains(string(api), want) {
+			t.Errorf("api.log lacks %q:\n%s", want, api)
+		}
+	}
+	web, _ := os.ReadFile(filepath.Join(logs, "web.log"))
+	if !strings.Contains(string(web), "stub web ready") || strings.Contains(string(web), "listening on") {
+		t.Errorf("web.log:\n%s", web)
+	}
+	cmd := exec.Command(flashpointBin, "logs", "api", "--since-build")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil || !strings.HasPrefix(string(out), "--- build #2 started") || strings.Contains(string(out), "listening on") {
+		t.Fatalf("logs --since-build: %q, %v", out, err)
+	}
+	if d := status(t, ctlClient(t, root)); d.Logs["api"] != filepath.Join(logs, "api.log") {
+		t.Fatalf("status logs %v", d.Logs)
 	}
 }

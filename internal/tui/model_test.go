@@ -226,7 +226,7 @@ func TestDemoFrame(t *testing.T) {
 	add(event.API, event.Output, "2026/10/02 15:04:20 GET /api/hello 200 301µs")
 	m.Update(statusMsg(event.Status{
 		API: event.APIBuildFailed, APIDetail: "./internal/api/hello.go:21:9: undefined: greeting", ErrorSeq: errLine.Seq,
-		Serving: true, Handoff: true, LastReady: 1400 * time.Millisecond,
+		Serving: true, Handoff: true, Watching: true, LastReady: 1400 * time.Millisecond,
 		Web: event.WebReady, APIURL: "http://localhost:8080", WebURL: "http://localhost:5173",
 	}))
 	out := m.render()
@@ -237,5 +237,17 @@ func TestDemoFrame(t *testing.T) {
 		if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestWatchOffIsShown(t *testing.T) {
+	m, _, _ := testModel()
+	m.Update(statusMsg(event.Status{API: event.APIReady, APIURL: "http://localhost:8080"}))
+	if !strings.Contains(screen(m), "watch: off · reload: signal") {
+		t.Fatal(screen(m))
+	}
+	m.Update(statusMsg(event.Status{API: event.APIReady, Watching: true, APIURL: "http://localhost:8080"}))
+	if strings.Contains(screen(m), "watch: off") {
+		t.Fatal("shown while watching")
 	}
 }

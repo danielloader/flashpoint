@@ -139,6 +139,21 @@ func TestResolveSamePortIsAnError(t *testing.T) {
 	}
 }
 
+func TestResolveWatch(t *testing.T) {
+	root := project(t)
+	p, _ := Resolve(root, File{}, Overrides{}, noEnv)
+	if !p.Watch {
+		t.Fatal("watching should be on by default")
+	}
+	off := false
+	if p, _ := Resolve(root, File{Watch: Watch{Enabled: &off}}, Overrides{}, noEnv); p.Watch {
+		t.Fatal("watch.enabled = false should turn it off")
+	}
+	if p, _ := Resolve(root, File{}, Overrides{NoWatch: true}, noEnv); p.Watch {
+		t.Fatal("--watch=false should turn it off")
+	}
+}
+
 func TestResolveNoWeb(t *testing.T) {
 	root := project(t)
 	p, err := Resolve(root, File{}, Overrides{NoWeb: true}, noEnv)
@@ -232,5 +247,43 @@ func TestParseSignal(t *testing.T) {
 	}
 	if _, err := ParseSignal("SIGWINCH"); err == nil {
 		t.Error("want an error")
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{"10MB": 10 << 20, "512kb": 512 << 10, "1GB": 1 << 30, "300": 300, "7 B": 7} {
+		if got, err := ParseSize(in); err != nil || got != want {
+			t.Errorf("ParseSize(%q) = %d, %v", in, got, err)
+		}
+	}
+	if _, err := ParseSize("lots"); err == nil {
+		t.Error("want an error")
+	}
+}
+
+func TestResolveLogs(t *testing.T) {
+	root := project(t)
+	off := false
+	f := File{Logs: Logs{Dir: ".flashpoint/logs", Web: "web.txt", Timestamps: &off, MaxSize: Size{1 << 20}}}
+	p, err := Resolve(root, f, Overrides{Logs: Logs{API: "/tmp/api.log"}}, noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"api":        "/tmp/api.log",
+		"web":        filepath.Join(root, "web.txt"),
+		"flashpoint": filepath.Join(root, ".flashpoint", "logs", "flashpoint.log"),
+		"all":        filepath.Join(root, ".flashpoint", "logs", "all.log"),
+	}
+	for k, v := range want {
+		if p.Logs.Paths[k] != v {
+			t.Errorf("%s = %q, want %q", k, p.Logs.Paths[k], v)
+		}
+	}
+	if p.Logs.Timestamps || p.Logs.MaxSize != 1<<20 {
+		t.Errorf("logs %+v", p.Logs)
+	}
+	if p, _ := Resolve(root, File{}, Overrides{}, noEnv); len(p.Logs.Paths) != 0 || !p.Logs.Timestamps {
+		t.Errorf("default logs %+v", p.Logs)
 	}
 }
