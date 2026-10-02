@@ -103,7 +103,7 @@ main = "./cmd/server"        # main package to build
 port = 8080                  # the port your server listens on
 build_flags = ["-tags=dev"]  # added after flashpoint's own
 args = ["-v"]                # passed to the server (or: flashpoint -- -v)
-env = { LOG_LEVEL = "debug" }
+env = { LOG_LEVEL = "debug", DATABASE_URL = "${DATABASE_URL:-postgres://localhost/dev}" }
 ready_timeout = "15s"        # then: "API not listening on :8080"
 stop_signal = "SIGINT"       # sent to stop the old server
 stop_timeout = "10s"         # then SIGKILL
@@ -134,7 +134,7 @@ max_size = "10MB"            # then rotate to .1
 
 ### Environment
 
-flashpoint passes its own environment through, plus `api.env` and `web.env` from the config. It sets no ports or URLs. The only variable it adds is `FORCE_COLOR=1` for the web dev server in the TUI, so that Vite keeps its colours although its output goes to a pipe.
+flashpoint passes its own environment through, plus `api.env` and `web.env` from the config. Values in those expand `$VAR`, `${VAR}` and `${VAR:-default}` against the environment flashpoint was started with. That means `DATABASE_URL = "${DATABASE_URL:-postgres://localhost/dev}"` is a default the caller can override, and `DEV_APP_URL = "http://localhost:${WEB_PORT:-5173}"` follows the caller's port. A plain value, with no `$`, always overrides the caller's. It sets no ports or URLs. The only variable it adds is `FORCE_COLOR=1` for the web dev server in the TUI, so that Vite keeps its colours although its output goes to a pipe.
 
 ### Flags
 
@@ -157,7 +157,10 @@ flashpoint [flags] [-- server args]
 
 flashpoint reload [--wait] [--timeout 60s] [--web] [-C dir]
 flashpoint logs api|web|flashpoint|all [-n 100] [--since-build] [-C dir]
+flashpoint status [--json] [-C dir]
 ```
+
+Arguments for your server go after `--`, as in `flashpoint -- -v`. Any other word is rejected as an unknown command, so a typo like `flashpoint relaod` exits with code 2 instead of starting a stack.
 
 ### Exit codes
 
@@ -168,7 +171,7 @@ flashpoint logs api|web|flashpoint|all [-n 100] [--since-build] [-C dir]
 | 2 | bad flags or a bad `flashpoint.toml` |
 | 3 | a port is already in use |
 
-`flashpoint reload` and `flashpoint logs` exit with 0 on success, 1 when the build failed or the API did not come up, 4 when no flashpoint is running for the project, and 124 when `--timeout` runs out.
+`flashpoint reload`, `flashpoint logs` and `flashpoint status` exit with 0 on success, 1 when the build failed or the API did not come up, 4 when no flashpoint is running for the project, and 124 when `--timeout` runs out.
 
 ## Driving flashpoint from an agent or script
 
@@ -178,6 +181,7 @@ By default flashpoint rebuilds on every save. An agent that edits several files 
 |---|---|
 | `kill -USR1 $(cat .flashpoint/pid)` | fire and forget; no dependencies |
 | `flashpoint reload` | the same, from the CLI |
+| `flashpoint status [--json]` | what is running, its state and URLs; exit 4 when nothing is |
 | `flashpoint reload --wait` | blocks until the build is done: exit 0 once the new API answers, 1 with the compiler errors on stderr if it failed |
 | `curl --unix-socket .flashpoint/ctl -X POST 'http://flashpoint/reload?wait=1'` | the same over HTTP: `200 {"ok":true,"buildMs":812,…}`, or `422` with `"errors": [...]` |
 

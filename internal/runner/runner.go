@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/danielloader/flashpoint/internal/config"
@@ -207,16 +208,36 @@ func (m multi) Status(st event.Status) {
 // api.env from the config. flashpoint sets no ports or URLs: the app keeps
 // its own configuration.
 func apiEnv(plan *config.Plan) []string {
-	return append(os.Environ(), plan.Env...)
+	return append(os.Environ(), expandEnv(plan.Env, os.Getenv)...)
 }
 
 func webEnv(plan *config.Plan, color bool) []string {
-	env := append(os.Environ(), plan.Web.Env...)
+	env := append(os.Environ(), expandEnv(plan.Web.Env, os.Getenv)...)
 	if color {
 		// The dev server's stdout is a pipe; keep its colours for the TUI.
 		env = append(env, "FORCE_COLOR=1")
 	}
 	return env
+}
+
+// expandEnv expands $VAR, ${VAR} and ${VAR:-default} in each KEY=value
+// against the caller's environment, so a config value can be a default
+// that the caller overrides. A plain value always wins.
+func expandEnv(kvs []string, getenv func(string) string) []string {
+	out := make([]string, len(kvs))
+	for i, kv := range kvs {
+		k, v, _ := strings.Cut(kv, "=")
+		out[i] = k + "=" + os.Expand(v, func(name string) string {
+			if n, def, ok := strings.Cut(name, ":-"); ok {
+				if val := getenv(n); val != "" {
+					return val
+				}
+				return def
+			}
+			return getenv(name)
+		})
+	}
+	return out
 }
 
 // stateDir is a per-checkout directory for the build output, outside the

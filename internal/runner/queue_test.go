@@ -31,3 +31,25 @@ func TestSummarise(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandEnv(t *testing.T) {
+	env := map[string]string{"WEB_PORT": "5501", "DATABASE_URL": "postgres://caller"}
+	get := func(k string) string { return env[k] }
+	got := expandEnv([]string{
+		"DATABASE_URL=${DATABASE_URL:-postgres://default}",
+		"CACHE_URL=${CACHE_URL:-redis://default}",
+		"DEV_APP_URL=http://localhost:${WEB_PORT:-5273}",
+		"PLAIN=fixed",
+		"BARE=$WEB_PORT",
+	}, get)
+	want := []string{
+		"DATABASE_URL=postgres://caller",
+		"CACHE_URL=redis://default",
+		"DEV_APP_URL=http://localhost:5501",
+		"PLAIN=fixed",
+		"BARE=5501",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q", got)
+	}
+}

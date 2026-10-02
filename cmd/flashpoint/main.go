@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -49,6 +50,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "logs" {
 		os.Exit(logs(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		os.Exit(status(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -86,6 +90,7 @@ Usage:
   flashpoint [flags] [-- server args]
   flashpoint reload [--wait] [--timeout 60s]   rebuild the running instance
   flashpoint logs api|web|flashpoint|all [-n 100] [--since-build]
+  flashpoint status [--json]
 
 Flags:
 `)
@@ -106,6 +111,16 @@ Docs: https://github.com/danielloader/flashpoint
 		return exitOK
 	}
 	o.Args = fs.Args()
+	// Server arguments must follow "--": a stray word is a mistyped
+	// subcommand, and must not start a stack.
+	if start := len(args) - len(o.Args); len(o.Args) > 0 && (start == 0 || args[start-1] != "--") {
+		msg := fmt.Sprintf("unknown command %q", o.Args[0])
+		if s := suggest(o.Args[0]); s != "" {
+			msg += fmt.Sprintf(" (did you mean %s?)", s)
+		}
+		fmt.Fprintf(stderr, "flashpoint: %s\n  server arguments go after --: flashpoint -- %s\n", msg, strings.Join(o.Args, " "))
+		return exitUsage
+	}
 	o.NoWatch = !*watchFiles
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "log-timestamps" {
@@ -304,5 +319,82 @@ func logs(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, exitUsage, errors.New(strings.TrimSpace(string(b))))
 	}
 	io.Copy(stdout, resp.Body)
+	return exitOK
+}
+
+// commands are the subcommands, for "did you mean".
+var commands = []string{"reload", "logs", "status"}
+
+// suggest returns the subcommand within two edits of word, if any.
+func suggest(word string) string {
+	best, bestD := "", 3
+	for _, c := range commands {
+		if d := distance(word, c); d < bestD {
+			best, bestD = c, d
+		}
+	}
+	return best
+}
+
+// distance is the Levenshtein distance between a and b.
+func distance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
+}
+
+// status prints the running instance's state: readable, or as JSON.
+func status(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("flashpoint status", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("C", ".", "the project, as for flashpoint")
+	asJSON := fs.Bool("json", false, "print GET /status as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitUsage
+	}
+	root, err := config.FindRoot(*dir)
+	if err != nil {
+		return fail(stderr, exitNotRunning, err)
+	}
+	c, err := runner.Client(root)
+	if err != nil {
+		return fail(stderr, exitNotRunning, fmt.Errorf("%w (%s)", err, root))
+	}
+	c.Timeout = 5 * time.Second
+	resp, err := c.Get("http://flashpoint/status")
+	if err != nil {
+		return fail(stderr, exitError, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fail(stderr, exitError, err)
+	}
+	if *asJSON {
+		stdout.Write(body)
+		return exitOK
+	}
+	var d runner.StatusDoc
+	if err := json.Unmarshal(body, &d); err != nil {
+		return fail(stderr, exitError, err)
+	}
+	fmt.Fprint(stdout, d.Text())
 	return exitOK
 }

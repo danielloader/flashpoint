@@ -182,7 +182,7 @@ type statusDoc struct {
 	Logs       map[string]string `json:"logs"`
 }
 
-func status(t *testing.T, c *http.Client) statusDoc {
+func getStatus(t *testing.T, c *http.Client) statusDoc {
 	t.Helper()
 	resp, err := c.Get("http://flashpoint/status")
 	if err != nil {
@@ -258,7 +258,7 @@ func TestRestartGapIsBounded(t *testing.T) {
 	r.wait(t, "api ▸ ready in")
 	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
 	ctl := ctlClient(t, root)
-	probeBefore := status(t, ctl).ProbeDials
+	probeBefore := getStatus(t, ctl).ProbeDials
 	dialsBefore := testDials.Load()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -326,7 +326,7 @@ func TestRestartGapIsBounded(t *testing.T) {
 	// was one refused dial; anything beyond that is churn.
 	const probes, restarts = 4, 1
 	td := testDials.Load() - dialsBefore
-	pd := status(t, ctl).ProbeDials - probeBefore
+	pd := getStatus(t, ctl).ProbeDials - probeBefore
 	bound := int64(probes*(restarts+1) + n + 2)
 	t.Logf("dials: test probes %d (bound %d), flashpoint probes %d (bound %d)", td, bound, pd, 10*restarts)
 	if td > bound {
@@ -500,7 +500,7 @@ func TestReloadWait(t *testing.T) {
 	}
 
 	// The same socket speaks plain HTTP.
-	d := status(t, ctlClient(t, root))
+	d := getStatus(t, ctlClient(t, root))
 	if d.API.State != "build failed" || !d.API.Serving {
 		t.Fatalf("status %+v", d)
 	}
@@ -517,9 +517,9 @@ func TestIdleOpensNoConnections(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	time.Sleep(time.Second)
-	before := status(t, ctl).ProbeDials
+	before := getStatus(t, ctl).ProbeDials
 	time.Sleep(10 * time.Second)
-	after := status(t, ctl).ProbeDials
+	after := getStatus(t, ctl).ProbeDials
 	t.Logf("flashpoint probe dials while idle for 10s: %d (total since start %d)", after-before, after)
 	if after != before {
 		t.Fatalf("flashpoint opened %d connections while idle", after-before)
@@ -552,7 +552,7 @@ func TestLogDir(t *testing.T) {
 	if err != nil || !strings.HasPrefix(string(out), "--- build #2 started") || strings.Contains(string(out), "listening on") {
 		t.Fatalf("logs --since-build: %q, %v", out, err)
 	}
-	if d := status(t, ctlClient(t, root)); d.Logs["api"] != filepath.Join(logs, "api.log") {
+	if d := getStatus(t, ctlClient(t, root)); d.Logs["api"] != filepath.Join(logs, "api.log") {
 		t.Fatalf("status logs %v", d.Logs)
 	}
 }
@@ -594,7 +594,49 @@ func TestNotListeningHint(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if d := status(t, ctlClient(t, root)); d.API.State != "offline" {
+	if d := getStatus(t, ctlClient(t, root)); d.API.State != "offline" {
 		t.Fatalf("status %+v", d)
+	}
+}
+
+func TestUnknownCommandStartsNothing(t *testing.T) {
+	const apiPort, webPort = 8514, 5514
+	root := project(t, apiPort, webPort)
+	cmd := exec.Command(flashpointBin, "--no-tui", "relaod")
+	cmd.Dir = root
+	out, _ := cmd.CombinedOutput()
+	if code := cmd.ProcessState.ExitCode(); code != exitUsage {
+		t.Fatalf("exit %d, want %d\n%s", code, exitUsage, out)
+	}
+	if !strings.Contains(string(out), `unknown command "relaod" (did you mean reload?)`) {
+		t.Fatalf("output %s", out)
+	}
+	if strings.Contains(string(out), "api http://") || portOpen(webPort) || portOpen(apiPort) {
+		t.Fatal("a stack started")
+	}
+}
+
+func TestStatusCommand(t *testing.T) {
+	const apiPort, webPort = 8514, 5514
+	root := project(t, apiPort, webPort)
+	run := func(args ...string) (int, string) {
+		cmd := exec.Command(flashpointBin, append([]string{"status"}, args...)...)
+		cmd.Dir = root
+		out, _ := cmd.CombinedOutput()
+		return cmd.ProcessState.ExitCode(), string(out)
+	}
+	if code, out := run(); code != exitNotRunning {
+		t.Fatalf("exit %d with nothing running, want %d: %s", code, exitNotRunning, out)
+	}
+	r := start(t, root)
+	r.wait(t, "api ▸ ready in")
+	code, out := run()
+	if code != 0 || !strings.Contains(out, "api  ready") || !strings.Contains(out, "http://localhost:8514") {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	code, out = run("--json")
+	var d statusDoc
+	if code != 0 || json.Unmarshal([]byte(out), &d) != nil || d.API.State != "ready" {
+		t.Fatalf("exit %d: %s", code, out)
 	}
 }

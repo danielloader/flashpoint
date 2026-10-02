@@ -208,7 +208,8 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.Encode(v)
 }
 
-type statusDoc struct {
+// StatusDoc is GET /status.
+type StatusDoc struct {
 	API struct {
 		State    string `json:"state"`
 		Detail   string `json:"detail,omitempty"`
@@ -220,27 +221,55 @@ type statusDoc struct {
 	} `json:"api"`
 	ProbeDials int64             `json:"probeDials"`
 	Logs       map[string]string `json:"logs,omitempty"`
-	Web        *struct {
-		State  string `json:"state"`
-		Detail string `json:"detail,omitempty"`
-		URL    string `json:"url"`
-	} `json:"web,omitempty"`
+	Web        *WebStatus        `json:"web,omitempty"`
 }
 
-func statusJSON(s event.Status) statusDoc {
-	var d statusDoc
+// WebStatus is the web part of StatusDoc.
+type WebStatus struct {
+	State  string `json:"state"`
+	Detail string `json:"detail,omitempty"`
+	URL    string `json:"url"`
+}
+
+func statusJSON(s event.Status) StatusDoc {
+	var d StatusDoc
 	d.API.State, d.API.Detail, d.API.Serving, d.API.URL = s.API.String(), s.APIDetail, s.Serving, s.APIURL
 	d.API.Watching = s.Watching
 	d.API.BuildMs, d.API.ReadyMs = s.LastBuild.Milliseconds(), s.LastReady.Milliseconds()
 	d.ProbeDials = s.ProbeDials
 	if s.Web != event.WebNone {
-		d.Web = &struct {
-			State  string `json:"state"`
-			Detail string `json:"detail,omitempty"`
-			URL    string `json:"url"`
-		}{s.Web.String(), s.WebDetail, s.WebURL}
+		d.Web = &WebStatus{s.Web.String(), s.WebDetail, s.WebURL}
 	}
 	return d
+}
+
+// Text is the status for a person, one line per process.
+func (d StatusDoc) Text() string {
+	var b strings.Builder
+	api := fmt.Sprintf("api  %-12s %s", d.API.State, d.API.URL)
+	if d.API.BuildMs > 0 {
+		api += fmt.Sprintf("  (last build %dms, ready in %dms)", d.API.BuildMs, d.API.ReadyMs)
+	}
+	if d.API.Detail != "" {
+		api += "  " + d.API.Detail
+	}
+	b.WriteString(api + "\n")
+	if d.Web != nil {
+		web := fmt.Sprintf("web  %-12s %s", d.Web.State, d.Web.URL)
+		if d.Web.Detail != "" {
+			web += "  " + d.Web.Detail
+		}
+		b.WriteString(web + "\n")
+	}
+	if !d.API.Watching {
+		b.WriteString("file watching is off; flashpoint reload rebuilds\n")
+	}
+	for _, name := range logfile.Streams {
+		if p := d.Logs[name]; p != "" {
+			fmt.Fprintf(&b, "%s log: %s\n", name, p)
+		}
+	}
+	return b.String()
 }
 
 func (c *control) close() {
