@@ -58,7 +58,8 @@ brews:
     homepage: https://github.com/danielloader/flashpoint
     description: Hot reload for Go HTTP servers with a Vite/React front end, without dropped requests
     license: MIT
-    skip_upload: auto
+    # Skipped, not failed, while the HOMEBREW_TAP_TOKEN secret is unset.
+    skip_upload: '{{ if not (index .Env "HOMEBREW_TAP_TOKEN") }}true{{ else }}auto{{ end }}'
     install: |
       bin.install "flashpoint"
     test: |
