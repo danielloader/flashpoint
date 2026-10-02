@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -36,17 +35,9 @@ func RunShim(args []string) int {
 	cmd := exec.Command(fs.Arg(0), fs.Args()[1:]...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if n, _ := strconv.Atoi(os.Getenv("LISTEN_FDS")); n > 0 {
-		for i := range n {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, os.NewFile(uintptr(3+i), "listener"))
-		}
-	}
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "flashpoint: %v\n", err)
 		return 127
-	}
-	for _, f := range cmd.ExtraFiles {
-		f.Close()
 	}
 	pgid := cmd.Process.Pid
 	exited := make(chan error, 1)

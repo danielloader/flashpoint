@@ -33,7 +33,6 @@ type Spec struct {
 	Args       []string
 	Dir        string
 	Env        []string
-	ExtraFiles []*os.File
 	StopSignal syscall.Signal
 	Grace      time.Duration
 	// Line receives each line the child writes to stdout or stderr.
@@ -66,7 +65,6 @@ func Start(s Spec) (*Proc, error) {
 	cmd := exec.Command(self, args...)
 	cmd.Dir = s.Dir
 	cmd.Env = s.Env
-	cmd.ExtraFiles = s.ExtraFiles
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, err

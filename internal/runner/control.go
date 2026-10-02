@@ -214,7 +214,6 @@ type statusDoc struct {
 		Detail   string `json:"detail,omitempty"`
 		Serving  bool   `json:"serving"`
 		URL      string `json:"url"`
-		Handoff  bool   `json:"handoff"`
 		BuildMs  int64  `json:"buildMs"`
 		ReadyMs  int64  `json:"readyMs"`
 		Watching bool   `json:"watching"`
@@ -231,7 +230,7 @@ type statusDoc struct {
 func statusJSON(s event.Status) statusDoc {
 	var d statusDoc
 	d.API.State, d.API.Detail, d.API.Serving, d.API.URL = s.API.String(), s.APIDetail, s.Serving, s.APIURL
-	d.API.Handoff, d.API.Watching = s.Handoff, s.Watching
+	d.API.Watching = s.Watching
 	d.API.BuildMs, d.API.ReadyMs = s.LastBuild.Milliseconds(), s.LastReady.Milliseconds()
 	d.ProbeDials = s.ProbeDials
 	if s.Web != event.WebNone {

@@ -5,11 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/danielloader/flashpoint/internal/config"
@@ -18,9 +16,6 @@ import (
 	"github.com/danielloader/flashpoint/internal/proc"
 	"github.com/danielloader/flashpoint/internal/watch"
 )
-
-// ListenPackage is the helper a server imports to take flashpoint's socket.
-const ListenPackage = "github.com/danielloader/flashpoint/listen"
 
 // Control is a request from the front end.
 type Control int
@@ -95,11 +90,6 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 		defer w.Close()
 		relist = func() error { _, err := w.Relist(); return err }
 		log.infof(event.API, "watching %d packages of %s in %d directories", set.Packages, plan.Main, len(set.Dirs))
-	} else {
-		// Still listed once: it says whether the server imports listen.
-		if set, err = watch.List(plan.Root, plan.Main, plan.BuildFlags); err != nil {
-			return err
-		}
 	}
 	log.update(func(s *event.Status) { s.Watching = plan.Watch })
 
@@ -112,38 +102,19 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 		plan:   plan,
 		log:    log,
 		bin:    filepath.Join(state, binName(plan)),
-		reload: filepath.Join(state, "reload"),
 		exited: make(chan *proc.Proc, 4),
 		tail:   &tail{},
 		probe:  newProbeClient(&apiDials),
 		logs:   tee.Paths(),
 	}
-	// It must exist for the Vite plugin's watcher to see it change.
-	os.WriteFile(api.reload, nil, 0o644)
 	if err := checkFree("API", plan.APIPort); err != nil {
 		return err
 	}
-	if set.Imports[ListenPackage] {
-		ln, err := net.Listen("tcp", net.JoinHostPort(plan.APIHost, strconv.Itoa(plan.APIPort)))
-		if err != nil {
-			return &PortError{Name: "API", Port: plan.APIPort, Err: err}
-		}
-		f, err := ln.(*net.TCPListener).File()
-		ln.Close()
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		api.ln = f
-		log.update(func(s *event.Status) { s.Handoff = true })
-	} else {
-		log.infof(event.API, "the server binds its own port, so a restart refuses connections briefly; import %s to hand it flashpoint's socket", ListenPackage)
-	}
-	api.env = apiEnv(plan, api.ln != nil)
+	api.env = apiEnv(plan)
 
 	var web *webServer
 	if plan.Web != nil {
-		web = &webServer{plan: plan.Web, log: log, env: webEnv(plan, api.reload, opts.Color), dials: &webDials}
+		web = &webServer{plan: plan.Web, log: log, env: webEnv(plan, opts.Color), dials: &webDials}
 		if !plan.Web.PortOnArgv {
 			log.infof(event.Web, "the dev script is not plain vite, so the port is only in FLASHPOINT_WEB_PORT; make sure it reads it")
 		}
@@ -236,8 +207,8 @@ func (m multi) Status(st event.Status) {
 	}
 }
 
-func apiEnv(plan *config.Plan, handoff bool) []string {
-	env := clean(os.Environ(), "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES", "FLASHPOINT_PREFLIGHT")
+func apiEnv(plan *config.Plan) []string {
+	env := os.Environ()
 	env = append(env, plan.Env...)
 	env = append(env,
 		"FLASHPOINT=1",
@@ -247,39 +218,21 @@ func apiEnv(plan *config.Plan, handoff bool) []string {
 	if plan.Web != nil {
 		env = append(env, "FLASHPOINT_WEB_URL="+plan.WebURL())
 	}
-	if handoff {
-		env = append(env, "LISTEN_FDS=1", "LISTEN_FDNAMES=flashpoint")
-	}
 	return env
 }
 
-func webEnv(plan *config.Plan, reload string, color bool) []string {
-	env := clean(os.Environ(), "LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES")
+func webEnv(plan *config.Plan, color bool) []string {
+	env := os.Environ()
 	env = append(env, plan.Web.Env...)
 	env = append(env,
 		"FLASHPOINT=1",
 		"FLASHPOINT_API_URL="+plan.APIURL(),
 		"FLASHPOINT_WEB_PORT="+strconv.Itoa(plan.Web.Port),
-		"FLASHPOINT_RELOAD_FILE="+reload,
 	)
 	if color {
 		env = append(env, "FORCE_COLOR=1")
 	}
 	return env
-}
-
-func clean(env []string, drop ...string) []string {
-	out := env[:0:0]
-outer:
-	for _, kv := range env {
-		for _, d := range drop {
-			if strings.HasPrefix(kv, d+"=") {
-				continue outer
-			}
-		}
-		out = append(out, kv)
-	}
-	return out
 }
 
 // stateDir is a per-checkout directory for the build output, outside the

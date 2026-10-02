@@ -202,13 +202,13 @@ func TestSanitize(t *testing.T) {
 // TestDemoFrame renders a representative screen. With FLASHPOINT_FRAME set
 // it writes the frame there, which is how docs/demo.png is made.
 func TestDemoFrame(t *testing.T) {
-	m := newModel("v0.1.0", true, make(chan runner.Control, 1), func() {}, func(string) {})
+	m := newModel("v0.3.0", true, make(chan runner.Control, 1), func() {}, func(string) {})
 	m.Update(tea.WindowSizeMsg{Width: 110, Height: 28})
 	add := func(src event.Source, kind event.Kind, text string) { m.Update(linesMsg{line(src, kind, text)}) }
 	add(event.API, event.Info, "watching 14 packages of ./cmd/server in 16 directories")
 	add(event.Web, event.Output, "> vite --port 5173 --strictPort")
 	add(event.API, event.Output, "2026/10/02 15:02:32 listening on [::]:8080")
-	add(event.API, event.Info, "ready in 2.1s (build 1.3s, preflight 0.6s, swap 18ms)")
+	add(event.API, event.Info, "ready in 1.4s (build 1.3s, restart 42ms)")
 	add(event.Web, event.Output, "\x1b[32m  VITE v8.3.2\x1b[39m  ready in \x1b[1m145\x1b[22m ms")
 	add(event.Web, event.Output, "  \x1b[32m➜\x1b[39m  \x1b[1mLocal\x1b[22m:   \x1b[36mhttp://localhost:5173/\x1b[39m")
 	add(event.Web, event.Info, "ready on http://localhost:5173")
@@ -217,7 +217,7 @@ func TestDemoFrame(t *testing.T) {
 	add(event.API, event.Info, "internal/api/hello.go changed; building")
 	add(event.API, event.Output, "2026/10/02 15:04:02 stopped")
 	add(event.API, event.Output, "2026/10/02 15:04:02 listening on [::]:8080")
-	add(event.API, event.Info, "ready in 1.4s (build 1.1s, preflight 0.3s, swap 15ms)")
+	add(event.API, event.Info, "ready in 1.2s (build 1.1s, restart 38ms)")
 	add(event.API, event.Output, "2026/10/02 15:04:05 GET /api/hello 200 287µs")
 	add(event.API, event.Info, "internal/api/hello.go changed; building")
 	add(event.API, event.Error, "build failed in 0.4s; still serving the last good build")
@@ -226,7 +226,7 @@ func TestDemoFrame(t *testing.T) {
 	add(event.API, event.Output, "2026/10/02 15:04:20 GET /api/hello 200 301µs")
 	m.Update(statusMsg(event.Status{
 		API: event.APIBuildFailed, APIDetail: "./internal/api/hello.go:21:9: undefined: greeting", ErrorSeq: errLine.Seq,
-		Serving: true, Handoff: true, Watching: true, LastReady: 1400 * time.Millisecond,
+		Serving: true, Watching: true, LastReady: 1400 * time.Millisecond,
 		Web: event.WebReady, APIURL: "http://localhost:8080", WebURL: "http://localhost:5173",
 	}))
 	out := m.render()

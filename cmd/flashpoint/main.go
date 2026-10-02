@@ -1,5 +1,5 @@
 // Command flashpoint runs a Go HTTP server and a Vite app together, rebuilds
-// the server on save and swaps it in without refusing a connection.
+// the server on save while the old one keeps serving, then restarts it.
 package main
 
 import (

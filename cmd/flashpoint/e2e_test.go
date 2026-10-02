@@ -27,6 +27,10 @@ var flashpointBin, stubWebBin string
 // buildFlags builds flashpoint itself under -race when the tests run so.
 var buildFlags []string
 
+// maxOutage bounds the restart gap: the time from the old server stopping to
+// the new one answering.
+var maxOutage = 2 * time.Second
+
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "flashpoint-e2e")
 	if err != nil {
@@ -49,27 +53,19 @@ func TestMain(m *testing.M) {
 
 // project copies examples/basic's server into a temporary module that builds
 // against this checkout, with the stub in place of Vite.
-func project(t *testing.T, apiPort, webPort int, useListen bool) string {
+func project(t *testing.T, apiPort, webPort int) string {
 	t.Helper()
 	repo, _ := filepath.Abs("../..")
 	root, _ := filepath.EvalSymlinks(t.TempDir())
-	src, err := os.ReadFile(filepath.Join(repo, "examples", "basic", "main.go"))
+	main, err := os.ReadFile(filepath.Join(repo, "examples", "basic", "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	main := string(src)
-	if !useListen {
-		main = strings.Replace(main, "\t\"github.com/danielloader/flashpoint/listen\"\n", "\t\"net\"\n", 1)
-		main = strings.Replace(main, "listen.Listen(\":\" + port)", "net.Listen(\"tcp\", \":\"+port)", 1)
-	}
 	files := map[string]string{
-		"main.go": main,
-		"go.mod":  "module example.com/e2e\n\ngo 1.26.0\n\nrequire github.com/danielloader/flashpoint v0.0.0\n\nreplace github.com/danielloader/flashpoint => " + repo + "\n",
+		"main.go": string(main),
+		"go.mod":  "module example.com/e2e\n\ngo 1.26.0\n",
 		"flashpoint.toml": "[api]\nport = " + strconv.Itoa(apiPort) + "\nhealth = \"/healthz\"\n\n[web]\nport = " + strconv.Itoa(webPort) +
 			"\ncommand = \"exec " + stubWebBin + " {port}\"\n\n[watch]\ndebounce = \"50ms\"\n",
-	}
-	if !useListen {
-		files["go.mod"] = "module example.com/e2e\n\ngo 1.26.0\n"
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
@@ -237,9 +233,24 @@ func portOpen(port int) bool {
 	return false
 }
 
-func TestSwapRefusesNoConnections(t *testing.T) {
+// spans groups failure times into outages: failures less than gap apart
+// belong to the same one. It returns the longest outage.
+func longestOutage(times []time.Time, gap time.Duration) time.Duration {
+	var longest time.Duration
+	for i := 0; i < len(times); {
+		j := i
+		for j+1 < len(times) && times[j+1].Sub(times[j]) < gap {
+			j++
+		}
+		longest = max(longest, times[j].Sub(times[i]))
+		i = j + 1
+	}
+	return longest
+}
+
+func TestRestartGapIsBounded(t *testing.T) {
 	const apiPort, webPort = 8511, 5511
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	r := start(t, root)
 	r.wait(t, "api ▸ ready in")
 	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
@@ -248,17 +259,19 @@ func TestSwapRefusesNoConnections(t *testing.T) {
 	dialsBefore := testDials.Load()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	var ok, failed atomic.Int64
+	var ok atomic.Int64
 	var sawNew atomic.Bool
-	var firstErr atomic.Value
+	var mu sync.Mutex
+	var failures []time.Time
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {
 			for ctx.Err() == nil {
 				body, err := get(url)
 				if err != nil {
-					failed.Add(1)
-					firstErr.CompareAndSwap(nil, err.Error())
+					mu.Lock()
+					failures = append(failures, time.Now())
+					mu.Unlock()
 				} else {
 					ok.Add(1)
 					if strings.Contains(body, "Hello from flashpoint") {
@@ -274,51 +287,56 @@ func TestSwapRefusesNoConnections(t *testing.T) {
 		cancel()
 		wg.Wait()
 	})
+	nfail := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(failures)
+	}
 
 	time.Sleep(200 * time.Millisecond)
-	edit(t, root, `"Hello from Go"`, `"Hello from flashpoint"`)
-	r.wait(t, "api ▸ ready in")
-	// A broken build must leave the last good one serving.
+	// A broken build must leave the running server answering throughout.
 	edit(t, root, `const message =`, `const message`)
 	r.wait(t, "api ▸ build failed")
 	time.Sleep(200 * time.Millisecond)
-	// Fixed back to the bytes already serving: nothing to restart.
-	edit(t, root, `const message`, `const message =`)
-	r.wait(t, "api ▸ no change")
+	if n := nfail(); n > 0 {
+		t.Fatalf("%d requests failed while a broken build ran; the old server should have kept serving", n)
+	}
+	// Fixed, with a new message: one restart.
+	edit(t, root, `const message "Hello from Go"`, `const message = "Hello from flashpoint"`)
+	r.wait(t, "api ▸ ready in")
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 	wg.Wait()
 
-	if n := failed.Load(); n > 0 {
-		t.Fatalf("%d of %d requests failed during the swaps; first: %v", n, n+ok.Load(), firstErr.Load())
-	}
-	// One restart happened (the fix-back was byte-identical). Each probe
-	// needs a new connection when the old server closes its own; the +2 is
-	// slack for a probe that races the close and redials.
-	const probes, restarts = 4, 1
-	td := testDials.Load() - dialsBefore
-	pd := status(t, ctl).ProbeDials - probeBefore
-	t.Logf("dials: test probes %d (bound %d), flashpoint probes %d (bound %d), over %d requests", td, probes*(restarts+1)+2, pd, 2*restarts, ok.Load())
-	if td > probes*(restarts+1)+2 {
-		t.Errorf("test probes opened %d connections for %d restart(s)", td, restarts)
-	}
-	if pd > 2*restarts {
-		t.Errorf("flashpoint opened %d probe connections for %d restart(s)", pd, restarts)
+	mu.Lock()
+	outage := longestOutage(failures, 200*time.Millisecond)
+	n := len(failures)
+	mu.Unlock()
+	t.Logf("restart: %d failed requests, longest outage %v, %d ok", n, outage, ok.Load())
+	if outage > maxOutage {
+		t.Fatalf("the API was down for %v during the restart", outage)
 	}
 	if !sawNew.Load() {
 		t.Fatal("never saw the new build's response")
 	}
-	if ok.Load() < 20 {
-		t.Fatalf("only %d requests ran", ok.Load())
+	// Each probe reconnects once after the restart, and each failed request
+	// was one refused dial; anything beyond that is churn.
+	const probes, restarts = 4, 1
+	td := testDials.Load() - dialsBefore
+	pd := status(t, ctl).ProbeDials - probeBefore
+	bound := int64(probes*(restarts+1) + n + 2)
+	t.Logf("dials: test probes %d (bound %d), flashpoint probes %d (bound %d)", td, bound, pd, 10*restarts)
+	if td > bound {
+		t.Errorf("test probes opened %d connections for %d restart(s)", td, restarts)
 	}
-	if !portOpen(webPort) {
-		t.Fatal("the web stub is not serving")
+	if pd > 10*restarts {
+		t.Errorf("flashpoint opened %d probe connections for %d restart(s)", pd, restarts)
 	}
 }
 
 func TestIdenticalBinaryIsNotRestarted(t *testing.T) {
 	const apiPort, webPort = 8512, 5512
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	r := start(t, root)
 	r.wait(t, "api ▸ ready in")
 	before, _ := get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello")
@@ -339,7 +357,7 @@ func TestStopLeavesNothingBehind(t *testing.T) {
 	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
 		t.Run(sig.String(), func(t *testing.T) {
 			const apiPort, webPort = 8513, 5513
-			root := project(t, apiPort, webPort, true)
+			root := project(t, apiPort, webPort)
 			r := start(t, root)
 			r.wait(t, "api ▸ ready in")
 			deadline := time.Now().Add(10 * time.Second)
@@ -365,22 +383,6 @@ func TestStopLeavesNothingBehind(t *testing.T) {
 	}
 }
 
-func TestServerWithoutListenStillReloads(t *testing.T) {
-	const apiPort, webPort = 8514, 5514
-	root := project(t, apiPort, webPort, false)
-	r := start(t, root)
-	r.wait(t, "api ▸ ready in")
-	edit(t, root, `"Hello from Go"`, `"Hello again"`)
-	r.wait(t, "api ▸ ready in")
-	body, err := get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello")
-	if err != nil || !strings.Contains(body, "Hello again") {
-		t.Fatalf("body %q, err %v", body, err)
-	}
-	if !strings.Contains(r.output(), "binds its own port") {
-		t.Fatal("no hint about the listen package")
-	}
-}
-
 func TestPortInUseFailsWithoutKilling(t *testing.T) {
 	const apiPort, webPort = 8515, 5515
 	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(apiPort))
@@ -388,7 +390,7 @@ func TestPortInUseFailsWithoutKilling(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	cmd := exec.Command(flashpointBin, "--no-tui")
 	cmd.Dir = root
 	out, _ := cmd.CombinedOutput()
@@ -407,7 +409,7 @@ func TestPortInUseFailsWithoutKilling(t *testing.T) {
 
 func TestOfflinePageExplainsAFailedBuild(t *testing.T) {
 	const apiPort, webPort = 8516, 5516
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	edit(t, root, `const message =`, `const message`)
 	r := start(t, root)
 	r.wait(t, "api ▸ build failed")
@@ -438,7 +440,7 @@ func reloadCmd(t *testing.T, root string, args ...string) (int, string, string) 
 
 func TestSignalReloadWithWatchingOff(t *testing.T) {
 	const apiPort, webPort = 8517, 5517
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	r := start(t, root, "--watch=false")
 	r.wait(t, "api ▸ ready in")
 	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
@@ -469,7 +471,7 @@ func TestSignalReloadWithWatchingOff(t *testing.T) {
 
 func TestReloadWait(t *testing.T) {
 	const apiPort, webPort = 8518, 5518
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	if code, _, _ := reloadCmd(t, root, "--wait"); code != exitNotRunning {
 		t.Fatalf("exit %d with nothing running, want %d", code, exitNotRunning)
 	}
@@ -503,7 +505,7 @@ func TestReloadWait(t *testing.T) {
 
 func TestIdleOpensNoConnections(t *testing.T) {
 	const apiPort, webPort = 8519, 5519
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	r := start(t, root)
 	r.wait(t, "api ▸ ready in")
 	ctl := ctlClient(t, root)
@@ -523,7 +525,7 @@ func TestIdleOpensNoConnections(t *testing.T) {
 
 func TestLogDir(t *testing.T) {
 	const apiPort, webPort = 8510, 5510
-	root := project(t, apiPort, webPort, true)
+	root := project(t, apiPort, webPort)
 	r := start(t, root, "--log-dir", filepath.Join(root, ".flashpoint", "logs"), "--watch=false")
 	r.wait(t, "api ▸ ready in")
 	edit(t, root, `const message =`, `const message`)

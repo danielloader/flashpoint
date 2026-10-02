@@ -275,11 +275,6 @@ func (m *model) helpRows() []string {
 	for _, k := range keys {
 		b.WriteString(fmt.Sprintf("%s  %s\n", sKey.Render(fmt.Sprintf("%-15s", k[0])), sDim.Render(k[1])))
 	}
-	mode := "on: restarts refuse no connections"
-	if !m.status.Handoff {
-		mode = "off: import github.com/danielloader/flashpoint/listen to enable"
-	}
-	b.WriteString("\n" + sDim.Render("socket handoff "+mode))
 	b.WriteString("\n\n" + sDim.Render("any key closes this"))
 	box := sBorder.Render(b.String())
 	placed := lipgloss.Place(m.width, m.logHeight(), lipgloss.Center, lipgloss.Center, box)

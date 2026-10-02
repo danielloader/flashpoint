@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,26 +95,23 @@ func (q *queue) take() (trigger, bool) {
 	return t, true
 }
 
-// apiServer builds the Go server and swaps it in. All of its methods run on
+// apiServer builds the Go server and restarts it. All of its methods run on
 // the loop goroutine except where noted.
 type apiServer struct {
 	plan    *config.Plan
 	log     *logger
 	bin     string
 	env     []string
-	ln      *os.File // the held socket; nil when the server binds its own
-	reload  string   // touched after each swap, for the Vite plugin
 	started bool
 
-	p       *proc.Proc
-	sum     [sha256.Size]byte
-	off     *offline
-	exited  chan *proc.Proc
-	tail    *tail
-	offText string
-	probe   *http.Client
-	builds  int
-	logs    map[string]string
+	p      *proc.Proc
+	sum    [sha256.Size]byte
+	off    *offline
+	exited chan *proc.Proc
+	tail   *tail
+	probe  *http.Client
+	builds int
+	logs   map[string]string
 }
 
 func (a *apiServer) loop(ctx context.Context, q *queue, relist func() error) {
@@ -180,10 +176,6 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 		a.log.infof(event.API, "building")
 	}
 	a.log.update(func(s *event.Status) { s.API = event.APIBuilding })
-	// Requests wait in the accept queue during the build rather than get a
-	// stale error from the offline page.
-	a.off.stop()
-	a.off = nil
 
 	t0 := time.Now()
 	out, err := a.build(ctx)
@@ -208,12 +200,12 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 	}
 	a.sum = sum
 
-	var tp time.Duration
-	if a.ln != nil && runtime.GOOS == "darwin" {
-		tp = a.preflight(ctx)
-	}
+	tp := preflight(a.bin, a.plan.Root)
 	t1 := time.Now()
 	a.stopChild()
+	a.off.stop()
+	a.off = nil
+	a.waitPortFree()
 	if err := a.startChild(); err != nil {
 		a.log.errorf(event.API, "start: %v", err)
 		a.log.update(func(s *event.Status) { s.API, s.Serving, s.APIDetail = event.APIOffline, false, err.Error() })
@@ -228,23 +220,15 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 		return Result{State: "not_ready", BuildMs: tb.Milliseconds(), Detail: detail, Errors: lines(a.tail.String())}
 	}
 	total := time.Since(t0)
-	detail := fmt.Sprintf("build %s", event.Seconds(tb))
+	detail := "build " + event.Seconds(tb)
 	if tp > 0 {
-		detail += fmt.Sprintf(", preflight %s", event.Seconds(tp))
+		detail += ", first-run check " + event.Seconds(tp)
 	}
-	what := "swap"
-	if a.ln == nil {
-		what = "restart"
-	}
-	detail += fmt.Sprintf(", %s %s", what, event.Seconds(time.Since(t1)))
-	msg := fmt.Sprintf("ready in %s (%s)", event.Seconds(total), detail)
+	msg := fmt.Sprintf("ready in %s (%s, restart %s)", event.Seconds(total), detail, event.Seconds(time.Since(t1)))
 	a.log.infof(event.API, "%s", msg)
 	a.log.update(func(s *event.Status) {
 		s.API, s.APIDetail, s.Serving, s.LastBuild, s.LastReady = event.APIReady, "", true, tb, total
 	})
-	if a.started {
-		os.WriteFile(a.reload, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)), 0o644)
-	}
 	a.started = true
 	return Result{OK: true, State: "ready", BuildMs: tb.Milliseconds(), Detail: msg, took: total}
 }
@@ -340,19 +324,31 @@ func firstLine(b []byte) string {
 	return "go build failed"
 }
 
-// preflight execs the new binary once while the old one still serves: macOS
-// assesses a never-run executable on its first exec, which took 0.35–1s in
-// measurements, and that should not be downtime. The listen package's init
-// exits at once under FLASHPOINT_PREFLIGHT=1.
-func (a *apiServer) preflight(ctx context.Context) time.Duration {
-	t := time.Now()
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, a.bin)
-	cmd.Dir = a.plan.Root
-	cmd.Env = append(os.Environ(), "FLASHPOINT_PREFLIGHT=1")
-	cmd.Run()
-	return time.Since(t)
+// portFreeTimeout bounds the wait for the old server's port to be released.
+const portFreeTimeout = 2 * time.Second
+
+// waitPortFree waits until the port can be bound again. The old process has
+// exited by now, but a child it left behind could still hold the socket;
+// after the bound the new server is started anyway and reports the clash.
+func (a *apiServer) waitPortFree() {
+	addr := a.addr()
+	deadline := time.Now().Add(portFreeTimeout)
+	for {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			ln.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			a.log.errorf(event.API, "port %d still in use %s after the old server stopped", a.plan.APIPort, portFreeTimeout)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (a *apiServer) addr() string {
+	return net.JoinHostPort(a.plan.APIHost, strconv.Itoa(a.plan.APIPort))
 }
 
 func (a *apiServer) startChild() error {
@@ -367,9 +363,6 @@ func (a *apiServer) startChild() error {
 			a.tail.add(s)
 			a.log.line(event.API, event.Output, s)
 		},
-	}
-	if a.ln != nil {
-		spec.ExtraFiles = []*os.File{a.ln}
 	}
 	a.tail.reset()
 	p, err := proc.Start(spec)
@@ -390,9 +383,7 @@ func (a *apiServer) stopChild() {
 	}
 }
 
-// waitReady polls the health path until the server answers. Under handoff
-// a request made before the server accepts waits in the queue rather than
-// failing, so this returns as soon as it is up.
+// waitReady polls the health path until the server answers.
 func (a *apiServer) waitReady(ctx context.Context) bool {
 	host := a.plan.APIHost
 	if host == "" || host == "0.0.0.0" || host == "::" {
@@ -400,8 +391,7 @@ func (a *apiServer) waitReady(ctx context.Context) bool {
 	}
 	url := "http://" + net.JoinHostPort(host, strconv.Itoa(a.plan.APIPort)) + a.plan.Health
 	c := a.probe
-	// The old server's keep-alive connection is dead after the swap, and
-	// none is kept open to the new one between swaps.
+	// None is kept open to the server between restarts.
 	defer c.CloseIdleConnections()
 	poll := backoff{d: 20 * time.Millisecond, max: 250 * time.Millisecond}
 	deadline := time.Now().Add(readyTimeout)
@@ -432,14 +422,12 @@ func (a *apiServer) waitReady(ctx context.Context) bool {
 	return false
 }
 
+// goOffline answers on the API port while no server runs, until the next
+// start, which closes it first.
 func (a *apiServer) goOffline(text string) {
-	if a.ln == nil {
-		return
-	}
 	a.off.stop()
-	a.offText = "flashpoint: " + text
-	body := a.offText
-	a.off = serveOffline(a.ln, func() string { return body })
+	body := "flashpoint: " + text
+	a.off = serveOffline(a.addr(), body)
 }
 
 // summarise names the changed files for a log line.

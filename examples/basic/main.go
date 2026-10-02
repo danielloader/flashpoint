@@ -6,13 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"github.com/danielloader/flashpoint/listen"
 )
 
 const message = "Hello from Go"
@@ -37,9 +36,7 @@ func main() {
 		w.Write([]byte("ok\n"))
 	})
 
-	// Under flashpoint this is the socket it holds across restarts; anywhere
-	// else it is a plain net.Listen.
-	ln, err := listen.Listen(":" + port)
+	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		log.Fatal(err)
 	}

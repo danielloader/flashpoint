@@ -82,13 +82,10 @@ type Status struct {
 	// Serving is true while some build is answering requests, which a
 	// failed build does not change.
 	Serving bool
-	// Handoff is true when the server takes flashpoint's socket, so restarts
-	// refuse no connections.
-	Handoff bool
 	// Watching is false when rebuilds happen only on request.
 	Watching  bool
 	LastBuild time.Duration
-	LastReady time.Duration // save to serving, for the last swap
+	LastReady time.Duration // save to serving, for the last restart
 	// ErrorSeq is the first line of the last failed build's output.
 	ErrorSeq uint64
 

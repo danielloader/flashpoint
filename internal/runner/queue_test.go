@@ -31,10 +31,3 @@ func TestSummarise(t *testing.T) {
 		}
 	}
 }
-
-func TestCleanEnv(t *testing.T) {
-	got := clean([]string{"LISTEN_FDS=1", "HOME=/h", "LISTEN_PIDX=2"}, "LISTEN_FDS")
-	if !slices.Equal(got, []string{"HOME=/h", "LISTEN_PIDX=2"}) {
-		t.Fatalf("got %q", got)
-	}
-}

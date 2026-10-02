@@ -1,7 +1,7 @@
 // Package plain prints labelled lines for CI logs, agents and pipes:
 //
 //	api │ listening
-//	api ▸ ready in 2.1s (build 1.3s, swap 0.1s)
+//	api ▸ ready in 1.4s (build 1.3s, restart 30ms)
 package plain
 
 import (

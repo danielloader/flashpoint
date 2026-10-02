@@ -1,22 +1,21 @@
 package runner
 
 import (
-	"context"
 	"net"
 	"net/http"
-	"os"
 	"time"
 )
 
-// offline answers on the held socket while no server does, so a request
-// after a failed build gets a 503 that says why instead of hanging in the
-// accept queue.
+// offline answers on the API port while no server runs, after a failed
+// build or a crash, so a request gets a 503 that says why instead of a
+// refused connection. It is closed before the next server starts.
 type offline struct {
 	srv *http.Server
 }
 
-func serveOffline(f *os.File, body func() string) *offline {
-	ln, err := net.FileListener(f)
+// serveOffline binds addr, or does nothing if something else holds it.
+func serveOffline(addr, body string) *offline {
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil
 	}
@@ -26,7 +25,7 @@ func serveOffline(f *os.File, body func() string) *offline {
 			w.Header().Set("Retry-After", "1")
 			w.Header().Set("X-Flashpoint", "offline")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte(body()))
+			w.Write([]byte(body))
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -34,13 +33,10 @@ func serveOffline(f *os.File, body func() string) *offline {
 	return &offline{srv: srv}
 }
 
-// stop closes its copy of the socket; the socket itself stays open, so
-// connections from here on queue for the next server.
+// stop releases the port; Close, not Shutdown, so it is free at once.
 func (o *offline) stop() {
 	if o == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	o.srv.Shutdown(ctx)
+	o.srv.Close()
 }
