@@ -1,0 +1,45 @@
+name: CI
+
+# No untrusted input flows into run blocks: PR titles, bodies and commit
+# messages are never interpolated into shell commands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test (race)
+        run: go test -race ./...
+
+      - name: Example builds
+        run: cd examples/basic && go build -o /dev/null .
+
+      - name: Cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -o /dev/null ./cmd/flashpoint
+          done

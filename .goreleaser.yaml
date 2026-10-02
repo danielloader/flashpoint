@@ -1,0 +1,97 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# The release workflow is .github/workflows/release.yml; `goreleaser release
+# --snapshot --clean` builds the same artifacts locally.
+
+version: 2
+
+project_name: flashpoint
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: flashpoint
+    main: ./cmd/flashpoint
+    binary: flashpoint
+    env:
+      - CGO_ENABLED=0
+    # Windows is not built: the child supervision relies on Unix process
+    # groups and signals.
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - README.md
+      - LICENSE*
+
+# A formula rather than a cask so it installs on Linuxbrew too; goreleaser
+# warns that `brews` is deprecated in favour of casks.
+brews:
+  - name: flashpoint
+    # The tap is a separate repo, so the workflow's GITHUB_TOKEN cannot push
+    # to it: HOMEBREW_TAP_TOKEN needs contents:write on danielloader/homebrew-tap.
+    repository:
+      owner: danielloader
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/danielloader/flashpoint
+    description: Hot reload for Go HTTP servers with a Vite/React front end, without dropped requests
+    license: MIT
+    skip_upload: auto
+    install: |
+      bin.install "flashpoint"
+    test: |
+      assert_match "flashpoint", shell_output("#{bin}/flashpoint --version")
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: danielloader
+    name: flashpoint
+  prerelease: auto
+  draft: false
+  footer: |
+    ### Install
+
+    ```
+    brew install danielloader/tap/flashpoint
+    ```
+
+    or `go install github.com/danielloader/flashpoint/cmd/flashpoint@{{ .Tag }}`, or download a binary below (macOS and Linux, amd64 and arm64).
