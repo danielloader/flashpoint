@@ -20,6 +20,6 @@ func main() {
 	if err := child.Start(); err != nil {
 		panic(err)
 	}
-	fmt.Println("stub web ready, api at", os.Getenv("FLASHPOINT_API_URL"))
+	fmt.Println("stub web ready")
 	child.Wait()
 }

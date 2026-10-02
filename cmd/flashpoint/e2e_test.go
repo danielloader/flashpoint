@@ -90,7 +90,7 @@ func start(t *testing.T, root string, args ...string) *session {
 	t.Helper()
 	cmd := exec.Command(flashpointBin, append([]string{"--no-tui"}, args...)...)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "FLASHPOINT_API_PORT=", "FLASHPOINT_WEB_PORT=")
+	cmd.Env = os.Environ()
 	out, _ := cmd.StdoutPipe()
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
