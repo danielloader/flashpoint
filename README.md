@@ -6,7 +6,7 @@ Hot reload for a **Go HTTP server with a Vite/React front end**: one command run
 
 ## Quick start
 
-1. **Install it.**
+1. **Install it:**
 
    ```
    brew install danielloader/tap/flashpoint
@@ -14,18 +14,16 @@ Hot reload for a **Go HTTP server with a Vite/React front end**: one command run
 
    Or use `go install github.com/danielloader/flashpoint/cmd/flashpoint@latest`. Binaries for macOS and Linux are on the [releases page](https://github.com/danielloader/flashpoint/releases).
 
-2. **Have your server read its port from `PORT`, and point Vite's proxy at `FLASHPOINT_API_URL`.**
+2. **Run `flashpoint` in your project.** It finds `go.mod`, your `main` package and your Vite app. Your app runs exactly as it does without flashpoint, with its own ports and its own Vite proxy config.
 
-   ```go
-   port := cmp.Or(os.Getenv("PORT"), "8080")
-   log.Fatal(http.ListenAndServe(":"+port, mux))
+3. **If your app doesn't use ports 8080 (Go) and 5173 (Vite)**, tell flashpoint which ports it does use, with `flashpoint --api-port 9000 --web-port 3000` or a `flashpoint.toml`:
+
+   ```toml
+   api.port = 9000
+   web.port = 3000
    ```
 
-   ```ts
-   server: { proxy: { "/api": process.env.FLASHPOINT_API_URL ?? "http://127.0.0.1:8080" } },
-   ```
-
-3. **Run `flashpoint`** in your project.
+   flashpoint only watches these ports, to know when each server is up, to link to them and to wait for the API port before a restart. It never sets them.
 
 ### What happens on save
 
@@ -43,20 +41,15 @@ flashpoint builds the new server in the background while the old one keeps answe
 | main package | the root package if it is `main`, otherwise the only `main` under `./cmd/...`, otherwise the only one in the module. If there are several, flashpoint lists them and asks for `--main`. |
 | Vite app | the first of `.`, `web/`, `frontend/`, `ui/` and `client/` with a `vite.config.*` |
 | package manager | `packageManager` in package.json, otherwise the nearest lockfile (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock(b)`, `package-lock.json`), otherwise npm |
-| dev command | `<pm> run dev`. When the script is plain `vite`, flashpoint adds `--port N --strictPort`. Otherwise it exports the port as `FLASHPOINT_WEB_PORT` and leaves the script alone. |
+| dev command | `<pm> run dev`, unchanged; `web.command` replaces it |
 
-## Ports, and running checkouts side by side
+## Ports
 
-The API defaults to port 8080 and the web app to 5173. Each can be set with a flag, an environment variable or the config file, in that order of precedence:
+flashpoint needs to know the ports your Go server and Vite dev server listen on. They default to 8080 and 5173, and you can change them with `--api-port`/`--web-port` or with `api.port`/`web.port` in `flashpoint.toml`. flashpoint uses them to show the URLs, to tell when each server is ready (its port accepts connections), to wait for the API port to be free before starting a new build, and to serve the 503 page while no server is up. If a declared port never comes up, the status bar says so, for example "API not listening on :8080 (check --api-port)".
 
-```
-flashpoint --api-port 8091 --web-port 5191
-FLASHPOINT_API_PORT=8091 FLASHPOINT_WEB_PORT=5191 flashpoint
-```
+Choosing ports is your app's job. To run two checkouts side by side, configure each one to use different ports, then tell flashpoint: `flashpoint --api-port 8501 --web-port 5501`.
 
-Port `0` picks a free port. Two worktrees can run at once, each with its own pair.
-
-If a port is taken, flashpoint says who holds it (via `lsof`, when it is installed) and exits with code 3. **It never kills the holder**, which might be your other checkout.
+If a port is taken when flashpoint starts, it says who holds it (via `lsof`, when it is installed) and exits with code 3. **It never kills the holder.**
 
 ## The TUI
 
@@ -107,21 +100,19 @@ Everything is optional. Put a `flashpoint.toml` at the project root, and unknown
 ```toml
 [api]
 main = "./cmd/server"        # main package to build
-port = 8080                  # 0 picks a free port
-host = ""                    # address to bind; empty means all interfaces
+port = 8080                  # the port your server listens on
 build_flags = ["-tags=dev"]  # added after flashpoint's own
 args = ["-v"]                # passed to the server (or: flashpoint -- -v)
 env = { LOG_LEVEL = "debug" }
-health = "/healthz"          # polled until it answers below 500; default "/"
-port_env = "PORT"            # variable that carries the port to the server
+ready_timeout = "15s"        # then: "API not listening on :8080"
 stop_signal = "SIGINT"       # sent to stop the old server
 stop_timeout = "10s"         # then SIGKILL
 
 [web]
 enabled = true
 dir = "frontend"
-command = "pnpm dev --port {port}"   # replaces the detected command; runs under sh -c
-port = 5173
+command = "pnpm dev"         # replaces `<pm> run dev`; runs under sh -c
+port = 5173                  # the port your dev server listens on
 env = { VITE_FLAG = "1" }
 
 [watch]
@@ -141,17 +132,9 @@ truncate = false             # append, with a session header
 max_size = "10MB"            # then rotate to .1
 ```
 
-`{port}` and `{api_url}` are replaced in `web.command`.
+### Environment
 
-### Environment flashpoint sets
-
-| variable | set for | value |
-|---|---|---|
-| `PORT` (or `api.port_env`) | API | the API port |
-| `FLASHPOINT=1` | both | |
-| `FLASHPOINT_API_URL` | both | `http://127.0.0.1:<api port>`, for the Vite proxy |
-| `FLASHPOINT_WEB_URL` | API | `http://localhost:<web port>` |
-| `FLASHPOINT_WEB_PORT` | web | the web port |
+flashpoint passes its own environment through, plus `api.env` and `web.env` from the config. It sets no ports or URLs. The only variable it adds is `FORCE_COLOR=1` for the web dev server in the TUI, so that Vite keeps its colours although its output goes to a pipe.
 
 ### Flags
 
@@ -159,8 +142,8 @@ max_size = "10MB"            # then rotate to .1
 flashpoint [flags] [-- server args]
   -C dir                 run in dir
   --main pkg             main package to build
-  --api-port N           API port
-  --web-port N           web port
+  --api-port N           the port your Go server listens on (default 8080)
+  --web-port N           the port your Vite dev server listens on (default 5173)
   --web-dir dir          the Vite app's directory
   --no-web               run the API only
   --no-tui               plain output
@@ -257,11 +240,11 @@ If you'd rather not use a hook, end the agent's edit step with `flashpoint reloa
 
 The design comes from replacing air in a large Go + React project, with about 600 packages in the build graph and a 61 MB binary. There, every save cost 6–8 seconds and seconds of failed requests.
 
-- **Build first, then restart.** The old server keeps serving during `go build`. A failed build changes nothing. The restart itself is stop (SIGINT, then SIGKILL after `stop_timeout`), a bounded wait of up to 2s for the port to be free, and start. While no server is running at all, for example after a failed first build or a crash, flashpoint answers on the port with a `503` that carries the compiler output, and it releases the port before the next start.
+- **Build first, then restart.** The old server keeps serving during `go build`. A failed build changes nothing. The restart itself is stop (SIGINT, then SIGKILL after `stop_timeout`), a bounded wait of up to 2s for the API port to be free, and start. The new server counts as ready once its port accepts a connection. While no server is running at all, for example after a failed first build or a crash, flashpoint answers on the port with a `503` that carries the compiler output, and it releases the port before the next start.
 - **Watch exactly what the build reads.** The watch set is `go list -deps` for the main package: the Go, cgo and `go:embed` files of your module's packages (and of workspace modules and local `replace`s), plus `go.mod`, `go.sum` and `go.work`. Tests, the module cache, `node_modules` and the front end are left out, with no globs to maintain. The list is refreshed after each build, and a trailing 150 ms debounce turns a burst of saves into one build.
 - **Skip restarts that change nothing.** If the new binary is byte-identical to the running one, nothing restarts. That covers same-content rewrites and comment edits outside the main package. An edit to the main package changes the binary's build ID, so it does restart.
 - **Fast dev build flags.** Builds use `-buildvcs=false -ldflags=-w`. A handler edit took 1.30s to produce a binary this way, against 1.79s with the defaults (median of 10 interleaved rounds). `-trimpath` is left out, so stack traces keep real paths.
-- **Probing is cheap and bounded.** The readiness check uses one keep-alive HTTP client, polling from 20 ms up to 250 ms with a 60 s deadline. The web check backs off to 1 s and stops once Vite answers. Nothing polls while idle. `GET /status` reports `probeDials`, and the tests assert that it stays at 0 over 10 idle seconds.
+- **Probing is cheap and bounded.** Readiness is one TCP connect per attempt, polling from 20 ms up to 250 ms, and every 2 s after `ready_timeout`. The web check backs off to 2 s and stops once Vite's port accepts. Nothing polls while idle. `GET /status` reports `probeDials`, and the tests assert that it stays at 0 over 10 idle seconds.
 - **Nothing is left behind.** Each child runs under a small shim in its own process group. When flashpoint exits, even by `kill -9`, the shim stops the whole group: npm, its shell and node. No orphan is left holding a port.
 
 In that project, a handler edit went from 6.6–8.0s to 2.4–2.7s until the API answered again. The earlier figure was air v1.62.0 with `delay = 2000` and `kill_delay = "2s"`.

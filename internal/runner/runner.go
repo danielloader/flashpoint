@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 
 	"github.com/danielloader/flashpoint/internal/config"
@@ -104,7 +103,7 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 		bin:    filepath.Join(state, binName(plan)),
 		exited: make(chan *proc.Proc, 4),
 		tail:   &tail{},
-		probe:  newProbeClient(&apiDials),
+		dials:  &apiDials,
 		logs:   tee.Paths(),
 	}
 	if err := checkFree("API", plan.APIPort); err != nil {
@@ -115,9 +114,6 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 	var web *webServer
 	if plan.Web != nil {
 		web = &webServer{plan: plan.Web, log: log, env: webEnv(plan, opts.Color), dials: &webDials}
-		if !plan.Web.PortOnArgv {
-			log.infof(event.Web, "the dev script is not plain vite, so the port is only in FLASHPOINT_WEB_PORT; make sure it reads it")
-		}
 		if _, err := os.Stat(filepath.Join(plan.Web.Dir, "node_modules")); err != nil && plan.Web.PackageManager != "" {
 			log.errorf(event.Web, "no node_modules in %s; run %s install", rel(plan.Root, plan.Web.Dir), plan.Web.PackageManager)
 		}
@@ -207,29 +203,17 @@ func (m multi) Status(st event.Status) {
 	}
 }
 
+// apiEnv is the environment the server would have without flashpoint, plus
+// api.env from the config. flashpoint sets no ports or URLs: the app keeps
+// its own configuration.
 func apiEnv(plan *config.Plan) []string {
-	env := os.Environ()
-	env = append(env, plan.Env...)
-	env = append(env,
-		"FLASHPOINT=1",
-		plan.PortEnv+"="+strconv.Itoa(plan.APIPort),
-		"FLASHPOINT_API_URL="+plan.APIURL(),
-	)
-	if plan.Web != nil {
-		env = append(env, "FLASHPOINT_WEB_URL="+plan.WebURL())
-	}
-	return env
+	return append(os.Environ(), plan.Env...)
 }
 
 func webEnv(plan *config.Plan, color bool) []string {
-	env := os.Environ()
-	env = append(env, plan.Web.Env...)
-	env = append(env,
-		"FLASHPOINT=1",
-		"FLASHPOINT_API_URL="+plan.APIURL(),
-		"FLASHPOINT_WEB_PORT="+strconv.Itoa(plan.Web.Port),
-	)
+	env := append(os.Environ(), plan.Web.Env...)
 	if color {
+		// The dev server's stdout is a pipe; keep its colours for the TUI.
 		env = append(env, "FORCE_COLOR=1")
 	}
 	return env

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -109,7 +108,7 @@ type apiServer struct {
 	off    *offline
 	exited chan *proc.Proc
 	tail   *tail
-	probe  *http.Client
+	dials  *dialCounter
 	builds int
 	logs   map[string]string
 }
@@ -212,7 +211,7 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 		return Result{State: "not_ready", Detail: err.Error()}
 	}
 	if !a.waitReady(ctx) {
-		detail := "the server did not answer " + a.plan.Health
+		detail := a.notListening()
 		if !a.p.Running() {
 			detail = fmt.Sprintf("the server exited with code %d", a.p.ExitCode())
 		}
@@ -343,7 +342,7 @@ func (a *apiServer) waitPortFree() {
 }
 
 func (a *apiServer) addr() string {
-	return net.JoinHostPort(a.plan.APIHost, strconv.Itoa(a.plan.APIPort))
+	return ":" + strconv.Itoa(a.plan.APIPort)
 }
 
 func (a *apiServer) startChild() error {
@@ -378,29 +377,36 @@ func (a *apiServer) stopChild() {
 	}
 }
 
-// waitReady polls the health path until the server answers.
+// notListening is the hint for a server that never accepts on its port.
+func (a *apiServer) notListening() string {
+	return fmt.Sprintf("API not listening on :%d (check --api-port)", a.plan.APIPort)
+}
+
+// accepts reports whether something accepts connections on the API port.
+func (a *apiServer) accepts(ctx context.Context) bool {
+	return dialable(ctx, a.dials, a.plan.APIPort)
+}
+
+// waitReady waits for the new server to accept on its port. After
+// ReadyTimeout it says so, and keeps checking every couple of seconds in
+// the background in case the server is only slow.
 func (a *apiServer) waitReady(ctx context.Context) bool {
-	host := a.plan.APIHost
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	url := "http://" + net.JoinHostPort(host, strconv.Itoa(a.plan.APIPort)) + a.plan.Health
-	c := a.probe
-	// None is kept open to the server between restarts.
-	defer c.CloseIdleConnections()
+	p := a.p
 	poll := backoff{d: 20 * time.Millisecond, max: 250 * time.Millisecond}
-	deadline := time.Now().Add(readyTimeout)
-	for p := a.p; time.Now().Before(deadline); {
+	deadline := time.Now().Add(a.plan.ReadyTimeout)
+	for {
 		if !p.Running() || ctx.Err() != nil {
 			return false
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if r, err := c.Do(req); err == nil {
-			io.Copy(io.Discard, r.Body)
-			r.Body.Close()
-			if r.StatusCode < 500 {
-				return true
-			}
+		if a.accepts(ctx) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			hint := a.notListening()
+			a.log.errorf(event.API, "%s after %s", hint, a.plan.ReadyTimeout)
+			a.log.update(func(s *event.Status) { s.API, s.Serving, s.APIDetail = event.APIOffline, false, hint })
+			go a.watchLate(ctx, p)
+			return false
 		}
 		select {
 		case <-ctx.Done():
@@ -410,11 +416,26 @@ func (a *apiServer) waitReady(ctx context.Context) bool {
 		case <-time.After(poll.next()):
 		}
 	}
-	a.log.errorf(event.API, "not answering %s after %s", url, readyTimeout)
-	a.log.update(func(s *event.Status) {
-		s.API, s.APIDetail = event.APIOffline, "not answering "+a.plan.Health
-	})
-	return false
+}
+
+// watchLate marks a slow server ready if it does start listening.
+func (a *apiServer) watchLate(ctx context.Context, p *proc.Proc) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.Done():
+			return
+		case <-t.C:
+			if a.accepts(ctx) {
+				a.log.infof(event.API, "now listening on :%d", a.plan.APIPort)
+				a.log.update(func(s *event.Status) { s.API, s.Serving, s.APIDetail = event.APIReady, true, "" })
+				return
+			}
+		}
+	}
 }
 
 // goOffline answers on the API port while no server runs, until the next

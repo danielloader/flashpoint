@@ -2,11 +2,9 @@ package config
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -38,16 +36,15 @@ type Plan struct {
 	Root       string
 	ConfigFile string // empty when there is no flashpoint.toml
 
-	Main        string
-	BuildFlags  []string
-	Args        []string
-	Env         []string
-	APIHost     string
-	APIPort     int
-	Health      string
-	PortEnv     string
-	StopSignal  syscall.Signal
-	StopTimeout time.Duration
+	Main       string
+	BuildFlags []string
+	Args       []string
+	Env        []string
+	APIPort    int
+	// ReadyTimeout bounds the wait for a new server to accept on APIPort.
+	ReadyTimeout time.Duration
+	StopSignal   syscall.Signal
+	StopTimeout  time.Duration
 
 	Web *WebPlan // nil when there is no web app or it is disabled
 
@@ -109,19 +106,12 @@ func resolveLogs(root string, f, o Logs, times *bool) LogPlan {
 
 // WebPlan is how to run the dev server.
 type WebPlan struct {
-	Dir  string
-	Argv []string
-	// PortOnArgv is false when flashpoint could not put the port on the
-	// command line; the dev server must read FLASHPOINT_WEB_PORT itself.
-	PortOnArgv     bool
+	Dir            string
+	Argv           []string
 	PackageManager string
 	Port           int
 	Env            []string
 }
-
-// APIURL is the address the dev server's proxy should use. 127.0.0.1, not
-// localhost: Node may resolve localhost to ::1 first.
-func (p *Plan) APIURL() string { return fmt.Sprintf("http://127.0.0.1:%d", p.APIPort) }
 
 // APIDisplayURL is the address shown to a person.
 func (p *Plan) APIDisplayURL() string { return fmt.Sprintf("http://localhost:%d", p.APIPort) }
@@ -135,21 +125,19 @@ func (p *Plan) WebURL() string {
 }
 
 // Resolve builds the Plan for the project at root.
-func Resolve(root string, f File, o Overrides, getenv func(string) string) (*Plan, error) {
+func Resolve(root string, f File, o Overrides) (*Plan, error) {
 	p := &Plan{
-		Root:        root,
-		Main:        first(o.Main, f.API.Main),
-		BuildFlags:  f.API.BuildFlags,
-		Args:        f.API.Args,
-		APIHost:     f.API.Host,
-		Health:      first(f.API.Health, "/"),
-		PortEnv:     first(f.API.PortEnv, "PORT"),
-		Logs:        resolveLogs(root, f.Logs, o.Logs, o.LogTimes),
-		Watch:       !o.NoWatch && (f.Watch.Enabled == nil || *f.Watch.Enabled),
-		Include:     f.Watch.Include,
-		Exclude:     f.Watch.Exclude,
-		Debounce:    or(f.Watch.Debounce.Duration, 150*time.Millisecond),
-		StopTimeout: or(f.API.StopTimeout.Duration, 10*time.Second),
+		Root:         root,
+		Main:         first(o.Main, f.API.Main),
+		BuildFlags:   f.API.BuildFlags,
+		Args:         f.API.Args,
+		ReadyTimeout: or(f.API.ReadyTimeout.Duration, 15*time.Second),
+		Logs:         resolveLogs(root, f.Logs, o.Logs, o.LogTimes),
+		Watch:        !o.NoWatch && (f.Watch.Enabled == nil || *f.Watch.Enabled),
+		Include:      f.Watch.Include,
+		Exclude:      f.Watch.Exclude,
+		Debounce:     or(f.Watch.Debounce.Duration, 150*time.Millisecond),
+		StopTimeout:  or(f.API.StopTimeout.Duration, 10*time.Second),
 	}
 	if _, err := os.Stat(filepath.Join(root, FileName)); err == nil {
 		p.ConfigFile = filepath.Join(root, FileName)
@@ -157,15 +145,12 @@ func Resolve(root string, f File, o Overrides, getenv func(string) string) (*Pla
 	if len(o.Args) > 0 {
 		p.Args = o.Args
 	}
-	if !strings.HasPrefix(p.Health, "/") {
-		return nil, fmt.Errorf("api.health %q must start with /", p.Health)
-	}
 	sig, err := ParseSignal(first(f.API.StopSignal, "SIGINT"))
 	if err != nil {
 		return nil, err
 	}
 	p.StopSignal = sig
-	if p.APIPort, err = port("API", o.APIPort, getenv("FLASHPOINT_API_PORT"), f.API.Port, DefaultAPIPort); err != nil {
+	if p.APIPort, err = port("API", o.APIPort, f.API.Port, DefaultAPIPort); err != nil {
 		return nil, err
 	}
 	p.Env = envList(f.API.Env)
@@ -197,19 +182,17 @@ func Resolve(root string, f File, o Overrides, getenv func(string) string) (*Pla
 		return p, nil
 	}
 	w := &WebPlan{Dir: filepath.Clean(dir), Env: envList(f.Web.Env)}
-	if w.Port, err = port("web", o.WebPort, getenv("FLASHPOINT_WEB_PORT"), f.Web.Port, DefaultWebPort); err != nil {
+	if w.Port, err = port("web", o.WebPort, f.Web.Port, DefaultWebPort); err != nil {
 		return nil, err
 	}
 	if w.Port == p.APIPort {
 		return nil, fmt.Errorf("the API and web ports are both %d", w.Port)
 	}
 	if f.Web.Command != "" {
-		cmd := strings.NewReplacer("{port}", strconv.Itoa(w.Port), "{api_url}", p.APIURL()).Replace(f.Web.Command)
-		w.Argv = []string{"sh", "-c", cmd}
-		w.PortOnArgv = strings.Contains(f.Web.Command, "{port}")
+		w.Argv = []string{"sh", "-c", f.Web.Command}
 	} else {
 		w.PackageManager = PackageManager(w.Dir, root)
-		if w.Argv, w.PortOnArgv, err = WebCommand(w.Dir, w.PackageManager, w.Port); err != nil {
+		if w.Argv, err = WebCommand(w.Dir, w.PackageManager); err != nil {
 			return nil, err
 		}
 	}
@@ -217,37 +200,20 @@ func Resolve(root string, f File, o Overrides, getenv func(string) string) (*Pla
 	return p, nil
 }
 
-// port resolves one port; 0 anywhere means "pick a free one".
-func port(name string, flag *int, env string, file *int, def int) (int, error) {
+// port resolves the port the app says it listens on: the flag, then the
+// config file, then the default.
+func port(name string, flag, file *int, def int) (int, error) {
 	n := def
 	switch {
 	case flag != nil:
 		n = *flag
-	case env != "":
-		v, err := strconv.Atoi(env)
-		if err != nil {
-			return 0, fmt.Errorf("%s port %q is not a number", name, env)
-		}
-		n = v
 	case file != nil:
 		n = *file
 	}
-	if n < 0 || n > 65535 {
+	if n < 1 || n > 65535 {
 		return 0, fmt.Errorf("%s port %d is out of range", name, n)
 	}
-	if n == 0 {
-		return freePort()
-	}
 	return n, nil
-}
-
-func freePort() (int, error) {
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return 0, err
-	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port, nil
 }
 
 // ParseSignal accepts "SIGINT", "INT" or "int".

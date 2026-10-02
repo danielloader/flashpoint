@@ -74,32 +74,29 @@ func ParseSize(v string) (int64, error) {
 type API struct {
 	// Main is the main package to build, e.g. "./cmd/server".
 	Main string `toml:"main"`
-	// Port the API listens on; 0 picks a free one.
+	// Port is the port your server listens on (flashpoint does not set it).
 	Port *int `toml:"port"`
-	// Host to bind; empty means all interfaces.
-	Host string `toml:"host"`
 	// BuildFlags are passed to go build after flashpoint's own.
 	BuildFlags []string `toml:"build_flags"`
 	// Args are passed to the server.
 	Args []string          `toml:"args"`
 	Env  map[string]string `toml:"env"`
-	// Health is the path polled until the server answers; default "/".
-	Health string `toml:"health"`
-	// PortEnv names the variable that carries the port to the server.
-	PortEnv     string   `toml:"port_env"`
-	StopSignal  string   `toml:"stop_signal"`
-	StopTimeout Duration `toml:"stop_timeout"`
+	// ReadyTimeout is how long a new server may take to accept on Port
+	// before flashpoint says it is not listening there.
+	ReadyTimeout Duration `toml:"ready_timeout"`
+	StopSignal   string   `toml:"stop_signal"`
+	StopTimeout  Duration `toml:"stop_timeout"`
 }
 
 // Web configures the Vite dev server.
 type Web struct {
 	Enabled *bool  `toml:"enabled"`
 	Dir     string `toml:"dir"`
-	// Command replaces the detected one. It runs under sh -c, with {port}
-	// and {api_url} replaced.
-	Command string            `toml:"command"`
-	Port    *int              `toml:"port"`
-	Env     map[string]string `toml:"env"`
+	// Command replaces `<package manager> run dev`. It runs under sh -c.
+	Command string `toml:"command"`
+	// Port is the port your dev server listens on (flashpoint does not set it).
+	Port *int              `toml:"port"`
+	Env  map[string]string `toml:"env"`
 }
 
 // Watch adds to and takes from the set of files that trigger a rebuild.

@@ -65,8 +65,10 @@ func project(t *testing.T, apiPort, webPort int) string {
 	files := map[string]string{
 		"main.go": string(main),
 		"go.mod":  "module example.com/e2e\n\ngo 1.26.0\n",
-		"flashpoint.toml": "[api]\nport = " + strconv.Itoa(apiPort) + "\nhealth = \"/healthz\"\n\n[web]\nport = " + strconv.Itoa(webPort) +
-			"\ncommand = \"exec " + stubWebBin + " {port}\"\n\n[watch]\ndebounce = \"50ms\"\n",
+		// The app's own configuration picks its ports (PORT, the stub's
+		// argument); flashpoint is only told them.
+		"flashpoint.toml": "[api]\nport = " + strconv.Itoa(apiPort) + "\nenv = { PORT = \"" + strconv.Itoa(apiPort) + "\" }\n\n[web]\nport = " + strconv.Itoa(webPort) +
+			"\ncommand = \"exec " + stubWebBin + " " + strconv.Itoa(webPort) + "\"\n\n[watch]\ndebounce = \"50ms\"\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
@@ -552,5 +554,47 @@ func TestLogDir(t *testing.T) {
 	}
 	if d := status(t, ctlClient(t, root)); d.Logs["api"] != filepath.Join(logs, "api.log") {
 		t.Fatalf("status logs %v", d.Logs)
+	}
+}
+
+// writeConfig replaces the project's flashpoint.toml.
+func writeConfig(t *testing.T, root, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "flashpoint.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeclaredAPIPort(t *testing.T) {
+	const apiPort, webPort = 8514, 5514
+	root := project(t, apiPort, webPort)
+	// No api.port in the file: the server listens where its own env says,
+	// and flashpoint is told with --api-port.
+	writeConfig(t, root, "[api]\nenv = { PORT = \"8514\" }\n\n[web]\nport = 5514\ncommand = \"exec "+stubWebBin+" 5514\"\n")
+	r := start(t, root, "--api-port", "8514")
+	r.wait(t, "api ▸ ready in")
+	if body, err := get("http://127.0.0.1:8514/api/hello"); err != nil || !strings.Contains(body, "Hello") {
+		t.Fatalf("body %q, %v", body, err)
+	}
+	if !strings.Contains(r.output(), "api http://localhost:8514 · web http://localhost:5514") {
+		t.Fatal("startup line lacks the declared ports")
+	}
+}
+
+func TestNotListeningHint(t *testing.T) {
+	const apiPort, webPort = 8514, 5514
+	root := project(t, apiPort, webPort)
+	// The server listens on 8512, but flashpoint was told 8514.
+	writeConfig(t, root, "[api]\nport = 8514\nready_timeout = \"1s\"\nenv = { PORT = \"8512\" }\n\n[web]\nport = 5514\ncommand = \"exec "+stubWebBin+" 5514\"\n")
+	r := start(t, root)
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(r.output(), "API not listening on :8514 (check --api-port)") {
+		if time.Now().After(deadline) {
+			t.Fatal("no not-listening hint")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if d := status(t, ctlClient(t, root)); d.API.State != "offline" {
+		t.Fatalf("status %+v", d)
 	}
 }

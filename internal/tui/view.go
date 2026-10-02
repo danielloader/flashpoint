@@ -239,7 +239,7 @@ func (m *model) hintRow() string {
 		return " " + lipgloss.NewStyle().Foreground(amber).Render("stopping…") + sDim.Render("  (ctrl+c again to leave now)")
 	case m.filtering:
 		return " " + sKey.Render("/") + " " + m.input + "█" + sDim.Render("   enter keep · esc clear")
-	case m.status.API == event.APIBuildFailed || m.status.API == event.APICrashed:
+	case m.status.API == event.APIBuildFailed || m.status.API == event.APICrashed || (m.status.API == event.APIOffline && m.status.APIDetail != ""):
 		detail := m.status.APIDetail
 		hint := ""
 		if m.status.API == event.APIBuildFailed {
@@ -247,6 +247,8 @@ func (m *model) hintRow() string {
 		}
 		room := m.width - lipgloss.Width(hint) - 4
 		return " " + sRed.Render("✗ "+ansi.Truncate(detail, max(10, room), "…")) + sDim.Render(hint)
+	case m.status.WebDetail != "" && m.status.Web != event.WebReady:
+		return " " + sRed.Render("✗ "+ansi.Truncate(m.status.WebDetail, max(10, m.width-4), "…"))
 	}
 	keys := []string{"r rebuild", "o open", "/ filter", "c clear", "tab switch", "? help", "q quit"}
 	for i, k := range keys {

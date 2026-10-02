@@ -62,8 +62,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		showVers = fs.Bool("version", false, "print the version and exit")
 	)
 	fs.StringVar(&o.Main, "main", "", "the main `package` to build, e.g. ./cmd/server")
-	fs.Func("api-port", "the API's `port` (default 8080, or $FLASHPOINT_API_PORT); 0 picks a free one", portFlag(&o.APIPort))
-	fs.Func("web-port", "the web app's `port` (default 5173, or $FLASHPOINT_WEB_PORT); 0 picks a free one", portFlag(&o.WebPort))
+	fs.Func("api-port", "the `port` your Go server listens on (default 8080)", portFlag(&o.APIPort))
+	fs.Func("web-port", "the `port` your Vite dev server listens on (default 5173)", portFlag(&o.WebPort))
 	fs.StringVar(&o.WebDir, "web-dir", "", "the Vite app's `dir` (default: found by its vite.config)")
 	fs.BoolVar(&o.NoWeb, "no-web", false, "run the API only")
 	fs.StringVar(&o.Logs.Dir, "log-dir", "", "write api.log, web.log, flashpoint.log and all.log in `dir` (agents: .flashpoint/logs)")
@@ -126,7 +126,7 @@ Docs: https://github.com/danielloader/flashpoint
 	if err != nil {
 		return fail(stderr, exitUsage, err)
 	}
-	plan, err := config.Resolve(root, file, o, os.Getenv)
+	plan, err := config.Resolve(root, file, o)
 	if err != nil {
 		return fail(stderr, exitError, err)
 	}

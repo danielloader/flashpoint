@@ -3,7 +3,7 @@ package runner
 import (
 	"context"
 	"net"
-	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -18,17 +18,17 @@ func (d *dialCounter) dial(ctx context.Context, network, addr string) (net.Conn,
 	return nd.DialContext(ctx, network, addr)
 }
 
-// newProbeClient is the one HTTP client the readiness probe uses: keep-alive
-// on, so polling an up server reuses a connection.
-func newProbeClient(d *dialCounter) *http.Client {
-	return &http.Client{
-		Timeout: 2 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         d.dial,
-			MaxIdleConnsPerHost: 1,
-			IdleConnTimeout:     30 * time.Second,
-		},
+// dialable reports whether something accepts on localhost:port, over IPv4
+// or IPv6, as the app may bind either.
+func dialable(ctx context.Context, d *dialCounter, port int) bool {
+	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	c, err := d.dial(ctx, "tcp", net.JoinHostPort("localhost", strconv.Itoa(port)))
+	if err != nil {
+		return false
 	}
+	c.Close()
+	return true
 }
 
 // backoff is a poll interval that starts at min and grows to max.

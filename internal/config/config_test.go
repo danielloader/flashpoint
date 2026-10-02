@@ -20,8 +20,6 @@ func write(t *testing.T, path, body string) {
 	}
 }
 
-func noEnv(string) string { return "" }
-
 func ptr(n int) *int { return &n }
 
 func TestParse(t *testing.T) {
@@ -83,21 +81,22 @@ func project(t *testing.T) string {
 
 func TestResolveDetects(t *testing.T) {
 	root := project(t)
-	p, err := Resolve(root, File{}, Overrides{}, noEnv)
+	p, err := Resolve(root, File{}, Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if p.Main != "./cmd/api" {
 		t.Errorf("main = %q", p.Main)
 	}
-	if p.APIPort != DefaultAPIPort || p.StopSignal != syscall.SIGINT || p.Health != "/" {
-		t.Errorf("api defaults: %d %v %q", p.APIPort, p.StopSignal, p.Health)
+	if p.APIPort != DefaultAPIPort || p.StopSignal != syscall.SIGINT {
+		t.Errorf("api defaults: %d %v", p.APIPort, p.StopSignal)
 	}
 	if p.Web == nil {
 		t.Fatal("no web app found")
 	}
-	want := []string{"pnpm", "run", "dev", "--port", "5173", "--strictPort"}
-	if !slices.Equal(p.Web.Argv, want) || !p.Web.PortOnArgv {
+	// The dev script as is: flashpoint passes no port to it.
+	want := []string{"pnpm", "run", "dev"}
+	if !slices.Equal(p.Web.Argv, want) || p.Web.Port != DefaultWebPort {
 		t.Errorf("argv = %q", p.Web.Argv)
 	}
 }
@@ -105,25 +104,22 @@ func TestResolveDetects(t *testing.T) {
 func TestResolvePrecedence(t *testing.T) {
 	root := project(t)
 	f := File{API: API{Port: ptr(8512)}, Web: Web{Port: ptr(5512)}}
-	env := func(k string) string {
-		return map[string]string{"FLASHPOINT_API_PORT": "8513"}[k]
-	}
-	p, err := Resolve(root, f, Overrides{WebPort: ptr(5514)}, env)
+	p, err := Resolve(root, f, Overrides{WebPort: ptr(5514)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.APIPort != 8513 {
-		t.Errorf("env should beat the file: api port %d", p.APIPort)
+	if p.APIPort != 8512 {
+		t.Errorf("the file should beat the default: api port %d", p.APIPort)
 	}
 	if p.Web.Port != 5514 {
-		t.Errorf("flag should beat the file: web port %d", p.Web.Port)
+		t.Errorf("the flag should beat the file: web port %d", p.Web.Port)
 	}
 }
 
-func TestResolveCommandPlaceholders(t *testing.T) {
+func TestResolveCommandIsVerbatim(t *testing.T) {
 	root := project(t)
-	f := File{API: API{Port: ptr(8515)}, Web: Web{Command: "bun x vite --port {port}", Port: ptr(5515)}}
-	p, err := Resolve(root, f, Overrides{}, noEnv)
+	f := File{Web: Web{Command: "bun x vite --port 5515"}}
+	p, err := Resolve(root, f, Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,31 +128,38 @@ func TestResolveCommandPlaceholders(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsPortZero(t *testing.T) {
+	root := project(t)
+	if _, err := Resolve(root, File{}, Overrides{APIPort: ptr(0)}); err == nil {
+		t.Fatal("port 0 cannot be observed; want an error")
+	}
+}
+
 func TestResolveSamePortIsAnError(t *testing.T) {
 	root := project(t)
-	if _, err := Resolve(root, File{}, Overrides{APIPort: ptr(5516), WebPort: ptr(5516)}, noEnv); err == nil {
+	if _, err := Resolve(root, File{}, Overrides{APIPort: ptr(5516), WebPort: ptr(5516)}); err == nil {
 		t.Fatal("want an error")
 	}
 }
 
 func TestResolveWatch(t *testing.T) {
 	root := project(t)
-	p, _ := Resolve(root, File{}, Overrides{}, noEnv)
+	p, _ := Resolve(root, File{}, Overrides{})
 	if !p.Watch {
 		t.Fatal("watching should be on by default")
 	}
 	off := false
-	if p, _ := Resolve(root, File{Watch: Watch{Enabled: &off}}, Overrides{}, noEnv); p.Watch {
+	if p, _ := Resolve(root, File{Watch: Watch{Enabled: &off}}, Overrides{}); p.Watch {
 		t.Fatal("watch.enabled = false should turn it off")
 	}
-	if p, _ := Resolve(root, File{}, Overrides{NoWatch: true}, noEnv); p.Watch {
+	if p, _ := Resolve(root, File{}, Overrides{NoWatch: true}); p.Watch {
 		t.Fatal("--watch=false should turn it off")
 	}
 }
 
 func TestResolveNoWeb(t *testing.T) {
 	root := project(t)
-	p, err := Resolve(root, File{}, Overrides{NoWeb: true}, noEnv)
+	p, err := Resolve(root, File{}, Overrides{NoWeb: true})
 	if err != nil || p.Web != nil {
 		t.Fatalf("web = %+v, err %v", p.Web, err)
 	}
@@ -201,29 +204,16 @@ func TestPackageManager(t *testing.T) {
 	}
 }
 
-func TestWebCommandOnlyAddsPortToVite(t *testing.T) {
-	cases := map[string]bool{
-		"vite":                     true,
-		"vite --host":              true,
-		"vite dev":                 true,
-		"vite build":               false,
-		"node server.js":           false,
-		"vite & tsc --watch":       false,
-		"concurrently vite tsc -w": false,
-	}
-	for script, want := range cases {
-		if got := isVite(script); got != want {
-			t.Errorf("isVite(%q) = %v", script, got)
-		}
-	}
+func TestWebCommandRunsTheDevScript(t *testing.T) {
 	dir := t.TempDir()
-	write(t, filepath.Join(dir, "package.json"), `{"scripts":{"dev":"vite"}}`)
-	argv, ok, err := WebCommand(dir, "npm", 5517)
-	if err != nil || !ok {
-		t.Fatal(err)
+	write(t, filepath.Join(dir, "package.json"), `{"scripts":{"dev":"vite --port 3000"}}`)
+	argv, err := WebCommand(dir, "npm")
+	if err != nil || !slices.Equal(argv, []string{"npm", "run", "dev"}) {
+		t.Fatalf("argv %q, %v", argv, err)
 	}
-	if want := []string{"npm", "run", "dev", "--", "--port", "5517", "--strictPort"}; !slices.Equal(argv, want) {
-		t.Errorf("npm argv = %q", argv)
+	write(t, filepath.Join(dir, "package.json"), `{"scripts":{}}`)
+	if _, err := WebCommand(dir, "npm"); err == nil {
+		t.Fatal("want an error without a dev script")
 	}
 }
 
@@ -265,7 +255,7 @@ func TestResolveLogs(t *testing.T) {
 	root := project(t)
 	off := false
 	f := File{Logs: Logs{Dir: ".flashpoint/logs", Web: "web.txt", Timestamps: &off, MaxSize: Size{1 << 20}}}
-	p, err := Resolve(root, f, Overrides{Logs: Logs{API: "/tmp/api.log"}}, noEnv)
+	p, err := Resolve(root, f, Overrides{Logs: Logs{API: "/tmp/api.log"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +273,15 @@ func TestResolveLogs(t *testing.T) {
 	if p.Logs.Timestamps || p.Logs.MaxSize != 1<<20 {
 		t.Errorf("logs %+v", p.Logs)
 	}
-	if p, _ := Resolve(root, File{}, Overrides{}, noEnv); len(p.Logs.Paths) != 0 || !p.Logs.Timestamps {
+	if p, _ := Resolve(root, File{}, Overrides{}); len(p.Logs.Paths) != 0 || !p.Logs.Timestamps {
 		t.Errorf("default logs %+v", p.Logs)
+	}
+}
+
+func TestParseDottedPorts(t *testing.T) {
+	// The two-line form the README shows.
+	f, err := Parse([]byte("api.port = 9000\nweb.port = 3000\n"))
+	if err != nil || *f.API.Port != 9000 || *f.Web.Port != 3000 {
+		t.Fatalf("%+v, %v", f, err)
 	}
 }

@@ -137,37 +137,15 @@ func readPackageJSON(dir string) (packageJSON, error) {
 	return p, json.Unmarshal(b, &p)
 }
 
-// WebCommand is the argv that starts the dev server in dir with pm. When the
-// dev script is Vite itself, the port is passed on its command line so the
-// project needs no change to run on any port.
-func WebCommand(dir, pm string, port int) ([]string, bool, error) {
+// WebCommand is the argv that starts the dev server in dir with pm: its
+// "dev" script, exactly as `<pm> run dev` would run it.
+func WebCommand(dir, pm string) ([]string, error) {
 	pkg, err := readPackageJSON(dir)
 	if err != nil {
-		return nil, false, fmt.Errorf("%s: %w", filepath.Join(dir, "package.json"), err)
+		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, "package.json"), err)
 	}
-	script, ok := pkg.Scripts["dev"]
-	if !ok {
-		return nil, false, fmt.Errorf("%s has no \"dev\" script; add one or set web.command in %s", filepath.Join(dir, "package.json"), FileName)
+	if _, ok := pkg.Scripts["dev"]; !ok {
+		return nil, fmt.Errorf("%s has no \"dev\" script; add one or set web.command in %s", filepath.Join(dir, "package.json"), FileName)
 	}
-	argv := []string{pm, "run", "dev"}
-	if !isVite(script) {
-		return argv, false, nil
-	}
-	if pm == "npm" {
-		argv = append(argv, "--")
-	}
-	return append(argv, "--port", fmt.Sprint(port), "--strictPort"), true, nil
-}
-
-// isVite reports whether a script is a plain `vite` (or `vite dev`/`vite
-// serve`) invocation, which takes --port; anything else might not.
-func isVite(script string) bool {
-	f := strings.Fields(script)
-	if len(f) == 0 || f[0] != "vite" {
-		return false
-	}
-	if len(f) > 1 && !strings.HasPrefix(f[1], "-") && f[1] != "dev" && f[1] != "serve" {
-		return false
-	}
-	return !strings.ContainsAny(script, "&|;")
+	return []string{pm, "run", "dev"}, nil
 }

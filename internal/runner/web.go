@@ -3,8 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"net"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -52,13 +50,14 @@ func (w *webServer) start(ctx context.Context) {
 // monitor marks the server ready once its port accepts, and down when it
 // exits.
 func (w *webServer) monitor(ctx context.Context, p *proc.Proc) {
-	addr := net.JoinHostPort("localhost", strconv.Itoa(w.plan.Port))
-	// One dial per attempt until the port accepts, then none: Vite's own
-	// exit is what marks it down.
-	poll := backoff{d: 100 * time.Millisecond, max: time.Second}
+	// One dial per attempt until the port accepts, then none: the dev
+	// server's own exit is what marks it down.
+	poll := backoff{d: 100 * time.Millisecond, max: 2 * time.Second}
+	deadline := time.Now().Add(webReadyTimeout)
+	hinted := false
 	t := time.NewTimer(poll.next())
 	defer t.Stop()
-	for ready := false; ; {
+	for {
 		select {
 		case <-ctx.Done():
 			return
@@ -71,23 +70,25 @@ func (w *webServer) monitor(ctx context.Context, p *proc.Proc) {
 			w.log.update(func(s *event.Status) { s.Web, s.WebDetail = event.WebDown, detail })
 			return
 		case <-t.C:
-			if ready {
-				continue
-			}
-			dctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
-			c, err := w.dials.dial(dctx, "tcp", addr)
-			cancel()
-			if err != nil {
-				t.Reset(poll.next())
-			} else {
-				c.Close()
-				ready = true
+			if dialable(ctx, w.dials, w.plan.Port) {
 				w.log.infof(event.Web, "ready on http://localhost:%d", w.plan.Port)
 				w.log.update(func(s *event.Status) { s.Web, s.WebDetail = event.WebReady, "" })
+				continue // the timer is not reset: no more dials, only the exit
 			}
+			if !hinted && time.Now().After(deadline) {
+				hinted = true
+				hint := fmt.Sprintf("Web not listening on :%d (check --web-port)", w.plan.Port)
+				w.log.errorf(event.Web, "%s after %s", hint, webReadyTimeout)
+				w.log.update(func(s *event.Status) { s.WebDetail = hint })
+			}
+			t.Reset(poll.next())
 		}
 	}
 }
+
+// webReadyTimeout is how long the dev server may take to accept on its port
+// before flashpoint says it is not listening there.
+const webReadyTimeout = 30 * time.Second
 
 func (w *webServer) stop() {
 	w.mu.Lock()
