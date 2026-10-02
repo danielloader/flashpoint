@@ -158,9 +158,20 @@ port = 5173
 env = { VITE_FLAG = "1" }
 
 [watch]
+enabled = true                                      # false: rebuild only on request
 include = ["config/**/*.yaml", "migrations/*.sql"]  # extra files that rebuild the API
 exclude = ["internal/gen/**"]                       # never rebuild for these
 debounce = "150ms"
+
+[logs]                       # paths are relative to the project root
+dir = ".flashpoint/logs"     # api.log, web.log, flashpoint.log and all.log
+api = ""                     # or name any stream's file on its own
+web = ""
+flashpoint = ""
+all = ""
+timestamps = true            # RFC 3339 prefix on each line
+truncate = false             # append, with a session header
+max_size = "10MB"            # then rotate to .1
 ```
 
 `{port}` and `{api_url}` are replaced in `web.command`.
@@ -181,14 +192,23 @@ debounce = "150ms"
 
 ```
 flashpoint [flags] [-- server args]
-  -C dir          run in dir
-  --main pkg      main package to build
-  --api-port N    API port
-  --web-port N    web port
-  --web-dir dir   the Vite app's directory
-  --no-web        run the API only
-  --no-tui        plain output
+  -C dir                 run in dir
+  --main pkg             main package to build
+  --api-port N           API port
+  --web-port N           web port
+  --web-dir dir          the Vite app's directory
+  --no-web               run the API only
+  --no-tui               plain output
+  --watch=false          rebuild only on SIGUSR1 or `flashpoint reload`
+  --log-dir dir          api.log, web.log, flashpoint.log, all.log
+  --log-api|--log-web|--log-flashpoint|--log-all path
+  --log-timestamps=false
+  --log-truncate
+  --log-max-size 10MB
   --version
+
+flashpoint reload [--wait] [--timeout 60s] [--web] [-C dir]
+flashpoint logs api|web|flashpoint|all [-n 100] [--since-build] [-C dir]
 ```
 
 ### Exit codes
@@ -199,6 +219,74 @@ flashpoint [flags] [-- server args]
 | 1 | could not start: no `go.mod`, no main package, a bad `package.json`, and similar |
 | 2 | bad flags or a bad `flashpoint.toml` |
 | 3 | a port is already in use |
+
+`flashpoint reload` and `flashpoint logs` exit with 0 on success, 1 when the build failed or the API did not come up, 4 when no flashpoint is running for the project, and 124 when `--timeout` runs out.
+
+## Driving flashpoint from an agent or script
+
+By default flashpoint rebuilds on every save. An agent that edits several files in a row may prefer to say when: run with `--watch=false` (or `watch.enabled = false`) and trigger rebuilds yourself. The triggers also work with watching on.
+
+| | |
+|---|---|
+| `kill -USR1 $(cat .flashpoint/pid)` | fire and forget; no dependencies |
+| `flashpoint reload` | the same, from the CLI |
+| `flashpoint reload --wait` | blocks until the build is done: exit 0 once the new API answers, 1 with the compiler errors on stderr if it failed |
+| `curl --unix-socket .flashpoint/ctl -X POST 'http://flashpoint/reload?wait=1'` | the same over HTTP: `200 {"ok":true,"buildMs":812,…}`, or `422` with `"errors": [...]` |
+
+A rebuild on request takes the same path as a save: the old server keeps serving while the new one builds, and the swap uses the held socket. The log says why each build ran: `reload requested (signal)` or `(cli)`. `SIGUSR2` (or `flashpoint reload --web`) restarts the web dev server. `SIGHUP` still means quit, because closing a terminal sends it.
+
+flashpoint keeps its per-project state in `.flashpoint/` at the project root. That directory holds `pid`, the control socket `ctl`, and log files if you ask for them, plus a `.gitignore` of its own so you never commit it. The watcher ignores it. The control socket is a unix socket (mode 0600) that speaks plain HTTP:
+
+| | |
+|---|---|
+| `POST /reload[?wait=1]` | rebuild; with `wait`, 200 when ready, 422 on a build failure |
+| `POST /restart-web` | restart the dev server |
+| `GET /status` | the API and web states, the URLs, the last build and ready times, the log paths |
+| `GET /logs/{api,web,flashpoint,all}?n=100&since_build=1` | the tail of a stream (also `flashpoint logs`) |
+
+There is no TCP control port for now. An opt-in `--control-addr` with a token, for containers, could come later.
+
+### One log file per stream
+
+`--log-dir .flashpoint/logs` is the recommended setup for agents. It writes `api.log` (the server's output), `web.log` (Vite's), `flashpoint.log` (builds, restarts, reloads and compiler errors) and `all.log` (all of them, labelled). Each line gets a timestamp and has its colours stripped (the terminal keeps them). Each file is flushed per line, so `tail -f` is live. Every build is bracketed in `api.log` and `flashpoint.log`:
+
+```
+2026-10-02T15:04:02.113+01:00 --- build #12 started (cli)
+2026-10-02T15:04:02.508+01:00 ./internal/api/hello.go:21:9: undefined: greeting
+2026-10-02T15:04:02.508+01:00 --- build #12 failed in 395ms
+```
+
+So `flashpoint logs api --since-build` (or a `grep` from the last marker) shows only what the last build did. The files are written in TUI and plain mode alike. A write error is reported once, and it never blocks a child. If the disk falls behind, lines are dropped and counted.
+
+```
+flashpoint --watch=false --log-dir .flashpoint/logs
+# … edit …
+flashpoint reload --wait && tail -n 50 .flashpoint/logs/api.log
+```
+
+### With Claude Code
+
+This hook in `.claude/settings.json` rebuilds after every edit. When the build fails, the compiler errors go back to Claude: exit code 2 feeds a PostToolUse hook's stderr to the model. When flashpoint isn't running, the hook stays quiet.
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "flashpoint reload --wait --timeout 90s >/dev/null; rc=$?; [ $rc -eq 1 ] && exit 2; exit 0"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If you'd rather not use a hook, end the agent's edit step with `flashpoint reload --wait`, and read `flashpoint logs api -n 50` when it fails.
 
 ## Why it's fast
 
@@ -224,6 +312,8 @@ The design comes from replacing air in a large Go + React project: about 600 pac
 | `-buildvcs=false -ldflags=-w` | **1.30s** |
 
 `-trimpath` is deliberately left out, so stack traces keep real, clickable paths and the build cache stays shared with your `go test` runs.
+
+**Probing is cheap and bounded.** The readiness check after a swap uses one HTTP client with keep-alive. It polls from 20 ms up to 250 ms, with a 60 s deadline, and drops its connection once the server answers. The web check dials until Vite's port accepts, backing off to 1 s, and then stops: Vite's exit is what marks it down. Nothing polls while the stack is idle. `GET /status` reports `probeDials`. The tests assert that it stays at 0 over 10 idle seconds and opens at most 2 connections per restart.
 
 **Nothing is left behind.** Each child runs under a small shim (flashpoint re-executed) in its own process group. The shim holds a pipe from flashpoint, and when the pipe closes it stops the whole group: npm, the shell it spawns, and node. It closes when flashpoint quits, and also when flashpoint is killed with `kill -9`. There are no orphans holding ports, and no `kill-port` scripts. Your server and Vite need no cooperation for this.
 
@@ -266,6 +356,10 @@ Choose air if you want one mature tool for any Go project with proxy-based live 
 - **State held in memory is lost on each restart**, like any restart-based reloader.
 - **The preflight relies on init order.** It exits from `listen`'s `init`. Go runs the inits of a package's dependencies first, so a package that does heavy work in its own `init` (such as opening a database) and does not import `listen` may run before it. Keep that work in `main`.
 - **flashpoint needs `go` on `PATH`**, plus your package manager when there is a web app.
+
+## Releasing
+
+Push a `v*` tag. The Release workflow runs goreleaser, which publishes the archives and updates `Formula/flashpoint.rb` in [danielloader/homebrew-tap](https://github.com/danielloader/homebrew-tap). The tap step needs the `HOMEBREW_TAP_TOKEN` secret, and goreleaser skips that step when the secret is unset. Published assets are never replaced: every release is a new tag.
 
 ## Licence
 
