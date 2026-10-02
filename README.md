@@ -262,6 +262,7 @@ Choose air if you want one mature tool for any Go project with proxy-based live 
 ## Caveats
 
 - **macOS and Linux only.**
+- **Drain before exiting.** flashpoint stops the old server with SIGINT and waits for it. `http.Server.Serve` returns as soon as `Shutdown` begins, so a `main` that returns at that point cuts off requests still in flight. Wait for `Shutdown` to finish, as [`examples/basic`](examples/basic/main.go) does.
 - **State held in memory is lost on each restart**, like any restart-based reloader.
 - **The preflight relies on init order.** It exits from `listen`'s `init`. Go runs the inits of a package's dependencies first, so a package that does heavy work in its own `init` (such as opening a database) and does not import `listen` may run before it. Keep that work in `main`.
 - **flashpoint needs `go` on `PATH`**, plus your package manager when there is a web app.
