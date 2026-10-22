@@ -104,6 +104,7 @@ port = 8080                  # the port your server listens on
 build_flags = ["-tags=dev"]  # added after flashpoint's own
 args = ["-v"]                # passed to the server (or: flashpoint -- -v)
 env = { LOG_LEVEL = "debug", DATABASE_URL = "${DATABASE_URL:-postgres://localhost/dev}" }
+env_file = [".env", ".env.local"]  # loaded in order; a change restarts the server
 ready_timeout = "15s"        # then: "API not listening on :8080"
 stop_signal = "SIGINT"       # sent to stop the old server
 stop_timeout = "10s"         # then SIGKILL
@@ -134,7 +135,13 @@ max_size = "10MB"            # then rotate to .1
 
 ### Environment
 
-flashpoint passes its own environment through, plus `api.env` and `web.env` from the config. Values in those expand `$VAR`, `${VAR}` and `${VAR:-default}` against the environment flashpoint was started with. That means `DATABASE_URL = "${DATABASE_URL:-postgres://localhost/dev}"` is a default the caller can override, and `DEV_APP_URL = "http://localhost:${WEB_PORT:-5173}"` follows the caller's port. A plain value, with no `$`, always overrides the caller's. It sets no ports or URLs. The only variable it adds is `FORCE_COLOR=1` for the web dev server in the TUI, so that Vite keeps its colours although its output goes to a pipe.
+flashpoint passes its own environment through, plus `api.env` and `web.env` from the config. Values in those expand `$VAR`, `${VAR}` and `${VAR:-default}` against the environment flashpoint was started with (for `api.env`, after the env files below). That means `DATABASE_URL = "${DATABASE_URL:-postgres://localhost/dev}"` is a default the caller can override, and `DEV_APP_URL = "http://localhost:${WEB_PORT:-5173}"` follows the caller's port. A plain value, with no `$`, always overrides the caller's. It sets no ports or URLs. The only variable it adds is `FORCE_COLOR=1` for the web dev server in the TUI, so that Vite keeps its colours although its output goes to a pipe.
+
+### Env files
+
+`api.env_file` lists dotenv files, relative to the project root, that the Go server gets on top of flashpoint's environment, with later files winning and `api.env` applied last. A missing file is skipped. A value in an env file overrides the same variable in your shell, so editing the file always takes effect.
+
+A running process's environment can't be changed from outside, so flashpoint restarts the server when an env file changes. It does not rebuild, because the binary is the same. The log names the variables that changed, never their values: `api ▸ .env changed (DATABASE_URL); restarting`. If no value changed (say, a comment edit), nothing restarts. If a file no longer parses, the error is logged and the server keeps its previous environment. `flashpoint reload` re-reads the files as well. The web dev server needs none of this: Vite loads and watches its own `.env` files.
 
 ### Flags
 

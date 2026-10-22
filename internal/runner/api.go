@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,11 +98,12 @@ func (q *queue) take() (trigger, bool) {
 // apiServer builds the Go server and restarts it. All of its methods run on
 // the loop goroutine except where noted.
 type apiServer struct {
-	plan    *config.Plan
-	log     *logger
-	bin     string
-	env     []string
-	started bool
+	plan     *config.Plan
+	log      *logger
+	bin      string
+	env      []string
+	envFiles []string // relative to the root, as the watcher names them
+	started  bool
 
 	p      *proc.Proc
 	sum    [sha256.Size]byte
@@ -164,6 +166,26 @@ func (a *apiServer) loop(ctx context.Context, q *queue, relist func() error) {
 }
 
 func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
+	changed := a.reloadEnv()
+	envOnly := len(t.files) > 0 && len(t.reasons) == 0 && !t.force && a.sum != [sha256.Size]byte{}
+	for _, f := range t.files {
+		envOnly = envOnly && slices.Contains(a.envFiles, f)
+	}
+	if envOnly {
+		// The binary is current; only a restart picks up the new values.
+		if len(changed) == 0 && a.p.Running() {
+			msg := fmt.Sprintf("%s changed; no variable changed", summarise(t.files))
+			a.log.infof(event.API, "%s", msg)
+			return Result{OK: true, State: "no_change", Detail: msg}
+		}
+		a.log.infof(event.API, "%s changed (%s); restarting", summarise(t.files), strings.Join(changed, ", "))
+		return a.restart(ctx, time.Now(), 0)
+	}
+	if len(changed) > 0 {
+		a.log.infof(event.API, "environment changed (%s)", strings.Join(changed, ", "))
+		t.force = true
+	}
+
 	switch {
 	case len(t.files) > 0 && len(t.reasons) > 0:
 		a.log.infof(event.API, "%s changed, and reload requested (%s); building", summarise(t.files), strings.Join(uniq(t.reasons), ", "))
@@ -198,7 +220,12 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 		return Result{OK: true, State: "no_change", BuildMs: tb.Milliseconds(), Detail: msg, took: tb}
 	}
 	a.sum = sum
+	return a.restart(ctx, t0, tb)
+}
 
+// restart stops the running server and starts the current binary. t0 is
+// when the cycle began and tb how long its build took, zero for none.
+func (a *apiServer) restart(ctx context.Context, t0 time.Time, tb time.Duration) Result {
 	t1 := time.Now()
 	a.stopChild()
 	a.off.stop()
@@ -219,12 +246,28 @@ func (a *apiServer) cycle(ctx context.Context, t trigger) Result {
 	}
 	total := time.Since(t0)
 	msg := fmt.Sprintf("ready in %s (build %s, restart %s)", event.Seconds(total), event.Seconds(tb), event.Seconds(time.Since(t1)))
+	if tb == 0 {
+		msg = fmt.Sprintf("ready in %s (restart only)", event.Seconds(total))
+	}
 	a.log.infof(event.API, "%s", msg)
 	a.log.update(func(s *event.Status) {
 		s.API, s.APIDetail, s.Serving, s.LastBuild, s.LastReady = event.APIReady, "", true, tb, total
 	})
 	a.started = true
 	return Result{OK: true, State: "ready", BuildMs: tb.Milliseconds(), Detail: msg, took: total}
+}
+
+// reloadEnv re-reads the env files and returns the names of the variables
+// that changed. If one no longer parses, the old environment stays.
+func (a *apiServer) reloadEnv() []string {
+	env, err := apiEnv(a.plan)
+	if err != nil {
+		a.log.errorf(event.API, "%v; keeping the previous environment", err)
+		return nil
+	}
+	changed := envDiff(a.env, env)
+	a.env = env
+	return changed
 }
 
 func lines(s string) []string {

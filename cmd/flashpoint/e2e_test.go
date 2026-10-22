@@ -104,7 +104,8 @@ func start(t *testing.T, root string, args ...string) *session {
 			r.mu.Lock()
 			r.lines = append(r.lines, l)
 			r.mu.Unlock()
-			if strings.HasPrefix(l, "api ▸ ready in") || strings.HasPrefix(l, "api ▸ build failed") || strings.HasPrefix(l, "api ▸ no change") {
+			if strings.HasPrefix(l, "api ▸ ready in") || strings.HasPrefix(l, "api ▸ build failed") || strings.HasPrefix(l, "api ▸ no change") ||
+				strings.HasSuffix(l, "no variable changed") {
 				r.ready <- l
 			}
 		}
@@ -638,5 +639,37 @@ func TestStatusCommand(t *testing.T) {
 	var d statusDoc
 	if code != 0 || json.Unmarshal([]byte(out), &d) != nil || d.API.State != "ready" {
 		t.Fatalf("exit %d: %s", code, out)
+	}
+}
+
+func TestEnvFileChangeRestartsWithoutBuilding(t *testing.T) {
+	const apiPort, webPort = 8520, 5520
+	root := project(t, apiPort, webPort)
+	edit(t, root, `"message": message,`, `"message": os.Getenv("GREETING"),`)
+	edit(t, root, `const message = "Hello from Go"`, ``)
+	writeConfig(t, root, "[api]\nport = 8520\nenv_file = [\".env\"]\nenv = { PORT = \"8520\" }\n\n[web]\nport = 5520\ncommand = \"exec "+stubWebBin+" 5520\"\n\n[watch]\ndebounce = \"50ms\"\n")
+	envPath := filepath.Join(root, ".env")
+	os.WriteFile(envPath, []byte("GREETING=first\n"), 0o644)
+	r := start(t, root)
+	r.wait(t, "api ▸ ready in")
+	url := "http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/hello"
+	if body, _ := get(url); !strings.Contains(body, "first") {
+		t.Fatalf("body %q", body)
+	}
+
+	os.WriteFile(envPath, []byte("# a comment\nGREETING=first\n"), 0o644)
+	r.wait(t, "api ▸ .env changed; no variable changed")
+
+	os.WriteFile(envPath, []byte("GREETING=second\n"), 0o644)
+	r.wait(t, "api ▸ ready in")
+	if body, _ := get(url); !strings.Contains(body, "second") {
+		t.Fatalf("body %q", body)
+	}
+	out := r.output()
+	if !strings.Contains(out, ".env changed (GREETING); restarting") || !strings.Contains(out, "(restart only)") {
+		t.Fatal("no env restart in the log")
+	}
+	if strings.Count(out, "; building") > 0 {
+		t.Fatal("an env change rebuilt the server")
 	}
 }

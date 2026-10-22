@@ -40,6 +40,7 @@ type Plan struct {
 	BuildFlags []string
 	Args       []string
 	Env        []string
+	EnvFiles   []string // absolute
 	APIPort    int
 	// ReadyTimeout bounds the wait for a new server to accept on APIPort.
 	ReadyTimeout time.Duration
@@ -154,6 +155,12 @@ func Resolve(root string, f File, o Overrides) (*Plan, error) {
 		return nil, err
 	}
 	p.Env = envList(f.API.Env)
+	for _, name := range f.API.EnvFile {
+		if !filepath.IsAbs(name) {
+			name = filepath.Join(root, name)
+		}
+		p.EnvFiles = append(p.EnvFiles, filepath.Clean(name))
+	}
 	if p.Main == "" {
 		if p.Main, err = DetectMain(root); err != nil {
 			return nil, err

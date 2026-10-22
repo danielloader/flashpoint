@@ -285,3 +285,18 @@ func TestParseDottedPorts(t *testing.T) {
 		t.Fatalf("%+v, %v", f, err)
 	}
 }
+
+func TestResolveEnvFiles(t *testing.T) {
+	root := project(t)
+	f, err := Parse([]byte("[api]\nenv_file = [\".env\", \"/etc/app.env\"]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := Resolve(root, f, Overrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{filepath.Join(root, ".env"), "/etc/app.env"}; !slices.Equal(p.EnvFiles, want) {
+		t.Fatalf("env files %q", p.EnvFiles)
+	}
+}

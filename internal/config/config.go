@@ -81,6 +81,9 @@ type API struct {
 	// Args are passed to the server.
 	Args []string          `toml:"args"`
 	Env  map[string]string `toml:"env"`
+	// EnvFile are dotenv files, relative to the project root, loaded in
+	// order before Env. A change to one restarts the server.
+	EnvFile []string `toml:"env_file"`
 	// ReadyTimeout is how long a new server may take to accept on Port
 	// before flashpoint says it is not listening there.
 	ReadyTimeout Duration `toml:"ready_timeout"`

@@ -5,8 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -15,6 +20,7 @@ import (
 	"github.com/danielloader/flashpoint/internal/logfile"
 	"github.com/danielloader/flashpoint/internal/proc"
 	"github.com/danielloader/flashpoint/internal/watch"
+	"github.com/joho/godotenv"
 )
 
 // Control is a request from the front end.
@@ -79,7 +85,7 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 			Root:       plan.Root,
 			Main:       plan.Main,
 			BuildFlags: plan.BuildFlags,
-			Include:    plan.Include,
+			Include:    append(slices.Clone(plan.Include), envPatterns(plan)...),
 			Exclude:    append([]string{".flashpoint/**"}, plan.Exclude...),
 			Debounce:   plan.Debounce,
 			OnError:    func(err error) { log.errorf(event.System, "watch: %v", err) },
@@ -110,7 +116,12 @@ func Run(ctx context.Context, plan *config.Plan, sink event.Sink, ctl <-chan Con
 	if err := checkFree("API", plan.APIPort); err != nil {
 		return err
 	}
-	api.env = apiEnv(plan)
+	if api.env, err = apiEnv(plan); err != nil {
+		return err
+	}
+	for _, name := range plan.EnvFiles {
+		api.envFiles = append(api.envFiles, rel(plan.Root, name))
+	}
 
 	var web *webServer
 	if plan.Web != nil {
@@ -204,11 +215,58 @@ func (m multi) Status(st event.Status) {
 	}
 }
 
-// apiEnv is the environment the server would have without flashpoint, plus
-// api.env from the config. flashpoint sets no ports or URLs: the app keeps
-// its own configuration.
-func apiEnv(plan *config.Plan) []string {
-	return append(os.Environ(), expandEnv(plan.Env, os.Getenv)...)
+// apiEnv is the environment the server would have without flashpoint, then
+// the api.env_file files in order, then api.env from the config. A missing
+// env file is skipped. flashpoint sets no ports or URLs: the app keeps its
+// own configuration.
+func apiEnv(plan *config.Plan) ([]string, error) {
+	env := os.Environ()
+	for _, name := range plan.EnvFiles {
+		b, err := os.ReadFile(name)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		m, err := godotenv.UnmarshalBytes(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", rel(plan.Root, name), err)
+		}
+		for _, k := range slices.Sorted(maps.Keys(m)) {
+			env = append(env, k+"="+m[k])
+		}
+	}
+	vars := envMap(env)
+	return append(env, expandEnv(plan.Env, func(k string) string { return vars[k] })...), nil
+}
+
+// envMap resolves an environment list; a later entry wins, as for exec.
+func envMap(env []string) map[string]string {
+	m := make(map[string]string, len(env))
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	return m
+}
+
+// envDiff names the variables that differ between two environments.
+func envDiff(a, b []string) []string {
+	ma, mb := envMap(a), envMap(b)
+	var out []string
+	for k, v := range mb {
+		if old, ok := ma[k]; !ok || old != v {
+			out = append(out, k)
+		}
+	}
+	for k := range ma {
+		if _, ok := mb[k]; !ok {
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 func webEnv(plan *config.Plan, color bool) []string {
@@ -254,6 +312,16 @@ func stateDir(root string) (string, error) {
 	sum := sha256.Sum256([]byte(root))
 	dir := filepath.Join(base, filepath.Base(root)+"-"+hex.EncodeToString(sum[:])[:10])
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+// envPatterns are the env files as watch patterns, so a change to one
+// reaches the build loop.
+func envPatterns(plan *config.Plan) []string {
+	var out []string
+	for _, name := range plan.EnvFiles {
+		out = append(out, filepath.ToSlash(rel(plan.Root, name)))
+	}
+	return out
 }
 
 func binName(plan *config.Plan) string {
